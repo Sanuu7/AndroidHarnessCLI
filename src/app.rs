@@ -22,8 +22,16 @@ pub enum Phase {
 }
 
 pub enum ToolState {
-    Running { started: u64 },
-    Done { ok: bool, ms: u64, output: String },
+    Running {
+        started: u64,
+    },
+    Done {
+        ok: bool,
+        ms: u64,
+        output: String,
+        /// When it landed, so the card can settle in and shake on failure.
+        at: u64,
+    },
 }
 
 pub enum Item {
@@ -75,6 +83,10 @@ pub struct Status {
     pub ctx_max: u64,
     pub cost: f64,
     pub cost_flash: u64,
+    // Displayed values walk toward the real ones so counters never jump.
+    anim_in: anim::Anim,
+    anim_out: anim::Anim,
+    anim_cost: anim::Anim,
 }
 
 impl Default for Status {
@@ -90,7 +102,53 @@ impl Default for Status {
             ctx_max: 128_000,
             cost: 0.0,
             cost_flash: 0,
+            anim_in: anim::Anim::at(0.0),
+            anim_out: anim::Anim::at(0.0),
+            anim_cost: anim::Anim::at(0.0),
         }
+    }
+}
+
+impl Status {
+    /// New usage numbers: targets update immediately, the readout catches up.
+    pub fn set_usage(&mut self, tokens_in: u64, tokens_out: u64, cost: f64, now: u64) {
+        if tokens_in != self.tokens_in {
+            self.anim_in.set(tokens_in as f32, now, 520);
+        }
+        if tokens_out != self.tokens_out {
+            self.anim_out.set(tokens_out as f32, now, 520);
+        }
+        if (cost - self.cost).abs() > f64::EPSILON {
+            self.anim_cost.set(cost as f32, now, 520);
+            self.cost_flash = now;
+        }
+        self.tokens_in = tokens_in;
+        self.tokens_out = tokens_out;
+        self.cost = cost;
+    }
+
+    pub fn disp_in(&self, now: u64) -> u64 {
+        self.anim_in.get(now).round().max(0.0) as u64
+    }
+
+    pub fn disp_out(&self, now: u64) -> u64 {
+        self.anim_out.get(now).round().max(0.0) as u64
+    }
+
+    pub fn disp_cost(&self, now: u64) -> f64 {
+        self.anim_cost.get(now).max(0.0) as f64
+    }
+
+    /// Context fill as a fraction, used by the meter and the percentage.
+    pub fn ctx_frac(&self, now: u64) -> f32 {
+        if self.ctx_max == 0 {
+            return 0.0;
+        }
+        ((self.anim_in.get(now) + self.anim_out.get(now)) / self.ctx_max as f32).clamp(0.0, 1.0)
+    }
+
+    pub fn ctx_pct(&self, now: u64) -> u32 {
+        (self.ctx_frac(now) * 100.0).round() as u32
     }
 }
 
@@ -117,6 +175,30 @@ pub struct Popup {
     pub filter: String,
     pub sel: usize,
     pub opened_at: u64,
+    /// Where the highlight was before, so it can cross-fade between rows.
+    pub sel_prev: usize,
+    pub sel_at: u64,
+}
+
+impl Popup {
+    pub fn new(filter: String, now: u64) -> Self {
+        Self {
+            filter,
+            sel: 0,
+            opened_at: now,
+            sel_prev: 0,
+            sel_at: now,
+        }
+    }
+
+    /// Move the highlight, remembering where it came from.
+    pub fn select(&mut self, sel: usize, now: u64) {
+        if sel != self.sel {
+            self.sel_prev = self.sel;
+            self.sel = sel;
+            self.sel_at = now;
+        }
+    }
 }
 
 impl Popup {
@@ -148,6 +230,10 @@ pub struct App {
     pub clear_screen: bool,
     pub ctrl_c_at: u64,
     pub view_h: Cell<u16>,
+    /// When the last message was sent, which lights up the composer.
+    pub sent_at: u64,
+    /// When a run was cancelled, which flashes the divider red.
+    pub cancel_at: u64,
 }
 
 impl App {
@@ -171,7 +257,14 @@ impl App {
             clear_screen: false,
             ctrl_c_at: 0,
             view_h: Cell::new(20),
+            sent_at: 0,
+            cancel_at: 0,
         }
+    }
+
+    /// Nothing on screen yet, so the views show the welcome.
+    pub fn is_empty_state(&self) -> bool {
+        self.items.is_empty() && !self.busy
     }
 
     pub fn update(&mut self, now: u64) {
@@ -189,16 +282,40 @@ impl App {
         if self.phase == Phase::Splash || self.busy {
             return true;
         }
+        // The welcome screen keeps its own gentle motion.
+        if self.is_empty_state() {
+            return true;
+        }
         if self.now.saturating_sub(self.chat_at) < 400
             || self.now.saturating_sub(self.status.cost_flash) < 700
+            || self.now.saturating_sub(self.sent_at) < 600
+            || self.now.saturating_sub(self.cancel_at) < 600
         {
+            return true;
+        }
+        if !self.status.anim_in.done(self.now) || !self.status.anim_out.done(self.now) {
             return true;
         }
         if self.items.iter().any(|i| self.now.saturating_sub(i.born()) < 300) {
             return true;
         }
+        // A card that just landed is still settling (or shaking).
+        if self.items.iter().any(|i| match i {
+            Item::Tool {
+                state: ToolState::Done { at, .. },
+                ..
+            } => self.now.saturating_sub(*at) < 700,
+            Item::Assistant { finished, .. } => {
+                *finished > 0 && self.now.saturating_sub(*finished) < 700
+            }
+            _ => false,
+        }) {
+            return true;
+        }
         if let Some(p) = &self.popup {
-            if self.now.saturating_sub(p.opened_at) < 260 {
+            if self.now.saturating_sub(p.opened_at) < 260
+                || self.now.saturating_sub(p.sel_at) < 200
+            {
                 return true;
             }
         }
@@ -268,15 +385,17 @@ impl App {
         if self.popup.is_some() {
             match key.code {
                 KeyCode::Up => {
+                    let now = self.now;
                     if let Some(p) = &mut self.popup {
-                        p.sel = p.sel.saturating_sub(1);
+                        p.select(p.sel.saturating_sub(1), now);
                     }
                     return;
                 }
                 KeyCode::Down => {
+                    let now = self.now;
                     if let Some(p) = &mut self.popup {
                         let n = p.matches().len();
-                        p.sel = (p.sel + 1).min(n.saturating_sub(1));
+                        p.select((p.sel + 1).min(n.saturating_sub(1)), now);
                     }
                     return;
                 }
@@ -366,20 +485,15 @@ impl App {
         let is_cmd = text.starts_with('/') && !text.contains('\n') && !text[1..].contains(' ');
         if is_cmd {
             let filter = text[1..].to_string();
+            let now = self.now;
             match &mut self.popup {
                 Some(p) => {
                     if p.filter != filter {
                         p.filter = filter;
-                        p.sel = 0;
+                        p.select(0, now);
                     }
                 }
-                None => {
-                    self.popup = Some(Popup {
-                        filter,
-                        sel: 0,
-                        opened_at: self.now,
-                    });
-                }
+                None => self.popup = Some(Popup::new(filter, now)),
             }
         } else {
             self.popup = None;
@@ -416,6 +530,7 @@ impl App {
             self.run_command(cmd.trim());
             return;
         }
+        self.sent_at = self.now;
         self.items.push(Item::User {
             text: text.clone(),
             born: self.now,
@@ -519,19 +634,22 @@ impl App {
                     .find(|i| matches!(i, Item::Tool { .. }))
                 {
                     if *n == name {
-                        *state = ToolState::Done { ok, ms, output };
+                        *state = ToolState::Done {
+                            ok,
+                            ms,
+                            output,
+                            at: self.now,
+                        };
                     }
                 }
             }
             AgentEvent::Usage { tokens_in, tokens_out, cost } => {
-                self.status.tokens_in = tokens_in;
-                self.status.tokens_out = tokens_out;
-                self.status.cost = cost;
-                self.status.cost_flash = self.now;
+                self.status.set_usage(tokens_in, tokens_out, cost, self.now);
             }
             AgentEvent::Cancelled => {
                 self.close_stream();
                 self.busy = false;
+                self.cancel_at = self.now;
                 self.note("cancelled", true);
             }
             AgentEvent::Done => {

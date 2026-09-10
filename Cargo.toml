@@ -1,8 +1,8 @@
 [package]
 name = "harness-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Harness for the terminal. Agent UI built for phones running Termux."
+description = "Android Harness CLI. Agent UI built for phones running Termux."
 license = "MIT"
 
 [[bin]]

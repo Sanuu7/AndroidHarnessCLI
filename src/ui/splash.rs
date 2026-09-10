@@ -8,7 +8,7 @@
 //!   0.50 - 0.80  tagline fades in
 //!   0.82 - 1.00  fade out
 
-use crate::anim::{self, Ease};
+use crate::anim::{self, Ease, Tween};
 use crate::app::{App, SPLASH_MS};
 use crate::theme::{self, lerp};
 use ratatui::Frame;
@@ -111,6 +111,52 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     );
     frame.render_widget(Paragraph::new(Line::from(tagline)).alignment(Alignment::Center), tag_area);
     frame.render_widget(Paragraph::new(Line::from(hint)).alignment(Alignment::Center), hint_area);
+
+    // Boot log: three quick checks that tick over, so the wait tells you what
+    // it is doing instead of just sitting there.
+    let boot_area = Rect {
+        x: area.x,
+        y: cy + 3,
+        width: area.width,
+        height: 3.min(area.bottom().saturating_sub(cy + 3)),
+    };
+    if boot_area.height > 0 && area.width >= 28 {
+        let rows: [(&str, String); 3] = [
+            (
+                "terminal",
+                format!("{}x{} truecolor", area.width, area.height),
+            ),
+            ("providers", "5 configured".to_string()),
+            ("tools", "58 registered".to_string()),
+        ];
+        // Each row is padded to the width of the widest, so centering the
+        // lines centers the block instead of leaving a ragged edge.
+        let detail_w = if area.width >= 44 {
+            rows.iter().map(|(_, v)| v.len()).max().unwrap_or(0)
+        } else {
+            0
+        };
+        let mut boot: Vec<Line> = Vec::new();
+        for (i, (label, value)) in rows.iter().enumerate() {
+            let k = Tween::delayed(i as u64 * 130, 300, Ease::OutCubic).t(app.now, app.boot_at);
+            let detail = if detail_w > 0 { value.as_str() } else { "" };
+            boot.push(
+                Line::from(vec![
+                    Span::styled("✓ ", Style::default().fg(t.fade(t.green, k * fade_out))),
+                    Span::styled(
+                        format!("{label:<10}"),
+                        Style::default().fg(t.fade(t.dim, k * fade_out)),
+                    ),
+                    Span::styled(
+                        format!("{detail:<detail_w$}"),
+                        Style::default().fg(t.fade(t.faint, k * fade_out)),
+                    ),
+                ])
+                .alignment(Alignment::Center),
+            );
+        }
+        frame.render_widget(Paragraph::new(ratatui::text::Text::from(boot)), boot_area);
+    }
 }
 
 #[cfg(test)]

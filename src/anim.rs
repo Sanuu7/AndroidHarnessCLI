@@ -97,6 +97,93 @@ pub fn spinner(now: u64) -> &'static str {
     SPIN[((now / 80) % SPIN.len() as u64) as usize]
 }
 
+/// A number that walks to its new value instead of jumping. Counters are the
+/// one place a terminal can feel smooth, so tokens and cost use this.
+#[derive(Clone, Copy, Default)]
+pub struct Anim {
+    from: f32,
+    to: f32,
+    at: u64,
+    dur: u64,
+}
+
+impl Anim {
+    pub const fn at(value: f32) -> Self {
+        Self {
+            from: value,
+            to: value,
+            at: 0,
+            dur: 0,
+        }
+    }
+
+    pub fn set(&mut self, target: f32, now: u64, dur: u64) {
+        self.from = self.to;
+        self.to = target;
+        self.at = now;
+        self.dur = dur.max(1);
+    }
+
+    pub fn get(&self, now: u64) -> f32 {
+        if self.from == self.to || self.dur == 0 {
+            return self.to;
+        }
+        let t = ease(
+            Ease::OutCubic,
+            (now.saturating_sub(self.at)) as f32 / self.dur as f32,
+        );
+        self.from + (self.to - self.from) * t
+    }
+
+    pub fn done(&self, now: u64) -> bool {
+        now >= self.at + self.dur
+    }
+}
+
+/// A short horizontal wobble, used to shake a card that failed.
+pub fn shake(now: u64, at: u64, dur: u64) -> i8 {
+    if now < at || now >= at + dur {
+        return 0;
+    }
+    let t = (now - at) as f32 / dur as f32;
+    let decay = 1.0 - t;
+    let phase = (t * 6.0 * std::f32::consts::PI).sin();
+    (phase * decay * 1.5).round() as i8
+}
+
+/// How strongly each glyph in a comet tail leans toward the caret color.
+/// The caret end gets the full `gain`, fading back through the tail.
+pub fn comet_weights(cols: usize, gain: f32) -> Vec<f32> {
+    (0..cols)
+        .map(|i| {
+            let d = (cols - 1 - i) as f32 / cols.max(1) as f32;
+            (1.0 - d).powf(2.2) * gain
+        })
+        .collect()
+}
+
+/// Alpha multiplier for a row under a fade mask at the top of a region.
+/// Row 0 is the topmost and therefore the faintest.
+pub fn top_mask(row: usize, rows: usize, strength: f32) -> f32 {
+    if rows == 0 {
+        return 1.0;
+    }
+    let d = 1.0 - (row as f32 / rows as f32);
+    (1.0 - d * strength).clamp(0.0, 1.0)
+}
+
+/// A skeleton placeholder row: faint cells with a bright band travelling
+/// through them, so the wait before the first token has something alive in it.
+pub fn skeleton_colors(cols: usize, phase: f32, width: f32, base: Rgb, hot: Rgb) -> Vec<Rgb> {
+    let center = phase * cols as f32;
+    (0..cols)
+        .map(|i| {
+            let w = bell(i as f32, center, width);
+            lerp(base, hot, 0.16 + w * 0.5)
+        })
+        .collect()
+}
+
 /// A text color where a bright band travels across `cols` characters.
 /// `phase` is 0..1 across the whole span; cells near it get brighter.
 pub fn shimmer_colors(
@@ -172,5 +259,60 @@ mod tests {
     fn bell_peaks_at_center() {
         assert!(bell(5.0, 5.0, 1.0) > bell(7.0, 5.0, 1.0));
         assert!((bell(5.0, 5.0, 1.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn anim_walks_to_target() {
+        let mut a = Anim::at(0.0);
+        assert_eq!(a.get(0), 0.0);
+        a.set(100.0, 1_000, 400);
+        assert_eq!(a.get(1_000), 0.0);
+        let mid = a.get(1_200);
+        assert!(mid > 0.0 && mid < 100.0, "mid={mid}");
+        assert_eq!(a.get(5_000), 100.0);
+        assert!(a.done(5_000));
+        assert!(!a.done(1_100));
+    }
+
+    #[test]
+    fn anim_without_movement_is_stable() {
+        let a = Anim::at(42.0);
+        assert_eq!(a.get(0), 42.0);
+        assert_eq!(a.get(9_999), 42.0);
+        assert!(a.done(9_999));
+    }
+
+    #[test]
+    fn shake_only_inside_its_window() {
+        assert_eq!(shake(100, 200, 300), 0);
+        assert_eq!(shake(600, 200, 300), 0);
+        assert!(shake(210, 200, 300).abs() <= 2);
+        assert!(shake(350, 200, 300).abs() <= 2);
+    }
+
+    #[test]
+    fn comet_is_brightest_at_the_caret() {
+        let weights = comet_weights(8, 1.0);
+        assert_eq!(weights.len(), 8);
+        assert!(weights[7] > weights[3]);
+        assert!(weights[3] > weights[0]);
+        assert!((weights[7] - 1.0).abs() < 1e-6, "caret end takes the full gain");
+        for w in comet_weights(6, 0.5) {
+            assert!(w <= 0.5, "gain caps the tail");
+        }
+    }
+
+    #[test]
+    fn top_mask_fades_upward() {
+        assert!(top_mask(0, 3, 0.8) < top_mask(1, 3, 0.8));
+        assert!(top_mask(1, 3, 0.8) < top_mask(2, 3, 0.8));
+        assert_eq!(top_mask(2, 3, 0.0), 1.0);
+    }
+
+    #[test]
+    fn skeleton_stays_within_palette() {
+        for c in skeleton_colors(20, 0.5, 3.0, (40, 40, 40), (200, 200, 200)) {
+            assert!(c.0 >= 40 && c.0 <= 200, "{c:?}");
+        }
     }
 }

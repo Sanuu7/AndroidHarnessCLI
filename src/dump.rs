@@ -4,12 +4,17 @@
 //! moment into ANSI text on stdout. It is how the UI gets reviewed (and
 //! screenshotted) without a terminal to drive.
 
-use crate::app::{App, Item, Phase, ToolState};
+use crate::app::{App, Item, Phase, Popup, ToolState};
 use crate::theme::{ColorLevel, Theme};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::{Color, Modifier};
 use std::io::{self, Write};
+
+pub const STATES: &[&str] = &[
+    "splash", "empty", "idle", "chat", "stream", "thinking", "tools", "error", "settle", "popup",
+    "help",
+];
 
 pub fn run(args: &[String]) -> io::Result<()> {
     let state = args.first().map(|s| s.as_str()).unwrap_or("chat");
@@ -33,23 +38,35 @@ pub fn run(args: &[String]) -> io::Result<()> {
     stdout.flush()
 }
 
+/// Usage numbers, already settled by the time this frame is taken.
+fn usage(app: &mut App, tokens_in: u64, tokens_out: u64, cost: f64, t: u64) {
+    app.status.set_usage(tokens_in, tokens_out, cost, t.saturating_sub(900));
+    app.status.cost_flash = t.saturating_sub(400);
+}
+
 fn build(state: &str, level: ColorLevel, t: u64) -> App {
     let mut app = App::new(Theme::forced(level));
     app.boot_at = 0;
     app.chat_at = 0;
     app.now = t;
-
-    let status = &mut app.status;
-    status.model = "glm-5.3-flash".into();
-    status.workspace = "AndroidHarness".into();
-    status.tokens_in = 12_480;
-    status.tokens_out = 1_164;
-    status.cost = 0.0031;
-    status.cost_flash = t.saturating_sub(400);
+    app.status.model = "glm-5.3-flash".into();
+    app.status.workspace = "AndroidHarness".into();
 
     match state {
         "splash" => {
             app.phase = Phase::Splash;
+        }
+        "empty" => {
+            app.phase = Phase::Chat;
+        }
+        "idle" => {
+            app.phase = Phase::Chat;
+            app.items = vec![Item::Assistant {
+                text: "Ready. What are we working on?".into(),
+                born: 0,
+                streaming: false,
+                finished: 100,
+            }];
         }
         "chat" => {
             app.phase = Phase::Chat;
@@ -75,12 +92,14 @@ fn build(state: &str, level: ColorLevel, t: u64) -> App {
                         ok: true,
                         ms: 8_400,
                         output: "3 tests completed, 3 passed".into(),
+                        at: 1_000,
                     },
                     born: 1_000,
                     expanded: false,
                     expand_at: 0,
                 },
             ];
+            usage(&mut app, 12_480, 1_164, 0.0031, t);
         }
         "stream" => {
             app.phase = Phase::Chat;
@@ -100,9 +119,8 @@ fn build(state: &str, level: ColorLevel, t: u64) -> App {
                     finished: 0,
                 },
             ];
-            app.status.tokens_in = 6_200;
-            app.status.tokens_out = 480;
-            app.status.cost = 0.0018;
+            app.sent_at = t.saturating_sub(900);
+            usage(&mut app, 6_200, 480, 0.0018, t);
         }
         "thinking" => {
             app.phase = Phase::Chat;
@@ -113,12 +131,11 @@ fn build(state: &str, level: ColorLevel, t: u64) -> App {
                     born: 0,
                 },
                 Item::Thinking {
-                    born: t.saturating_sub(900),
+                    born: t.saturating_sub(1_300),
                 },
             ];
-            app.status.tokens_in = 5_100;
-            app.status.tokens_out = 0;
-            app.status.cost = 0.0011;
+            app.sent_at = t.saturating_sub(1_400);
+            usage(&mut app, 5_100, 0, 0.0011, t);
         }
         "tools" => {
             app.phase = Phase::Chat;
@@ -135,6 +152,7 @@ fn build(state: &str, level: ColorLevel, t: u64) -> App {
                         ok: true,
                         ms: 6,
                         output: "wrote 34 bytes".into(),
+                        at: 300,
                     },
                     born: 200,
                     expanded: false,
@@ -147,6 +165,7 @@ fn build(state: &str, level: ColorLevel, t: u64) -> App {
                         ok: true,
                         ms: 11,
                         output: "8".into(),
+                        at: 500,
                     },
                     born: 400,
                     expanded: true,
@@ -156,7 +175,7 @@ fn build(state: &str, level: ColorLevel, t: u64) -> App {
                     name: "web_fetch".into(),
                     args: "https://example.com".into(),
                     state: ToolState::Running {
-                        started: t.saturating_sub(500),
+                        started: t.saturating_sub(2_400),
                     },
                     born: 500,
                     expanded: false,
@@ -168,6 +187,54 @@ fn build(state: &str, level: ColorLevel, t: u64) -> App {
                     error: false,
                 },
             ];
+            usage(&mut app, 12_480, 1_164, 0.0031, t);
+        }
+        "error" => {
+            app.phase = Phase::Chat;
+            app.busy = true;
+            app.items = vec![
+                Item::User {
+                    text: "run the test suite".into(),
+                    born: 0,
+                },
+                Item::Tool {
+                    name: "bash".into(),
+                    args: "gradle :app:test".into(),
+                    state: ToolState::Done {
+                        ok: false,
+                        ms: 3_200,
+                        output: "FAILED: 2 tests, 1 failure\n  TokenValidatorTest.boundary".into(),
+                        at: t.saturating_sub(120),
+                    },
+                    born: 200,
+                    expanded: false,
+                    expand_at: 0,
+                },
+                Item::Note {
+                    text: "tool failed, stopping here".into(),
+                    born: t.saturating_sub(80),
+                    error: true,
+                },
+            ];
+            usage(&mut app, 9_300, 620, 0.0024, t);
+        }
+        "settle" => {
+            app.phase = Phase::Chat;
+            app.items = vec![
+                Item::User {
+                    text: "summarize the last commit".into(),
+                    born: 0,
+                },
+                Item::Assistant {
+                    text: "The commit keyed the message loader so a send no longer remeasures the \
+                           list mid-scroll."
+                        .into(),
+                    born: 200,
+                    streaming: false,
+                    finished: t.saturating_sub(260),
+                },
+            ];
+            usage(&mut app, 7_400, 210, 0.0019, t);
         }
         "popup" => {
             app.phase = Phase::Chat;
@@ -176,11 +243,9 @@ fn build(state: &str, level: ColorLevel, t: u64) -> App {
                 born: 0,
             }];
             app.input.set_text("/");
-            app.popup = Some(crate::app::Popup {
-                filter: String::new(),
-                sel: 1,
-                opened_at: t.saturating_sub(900),
-            });
+            let mut popup = Popup::new(String::new(), t.saturating_sub(900));
+            popup.select(1, t.saturating_sub(120));
+            app.popup = Some(popup);
         }
         "help" => {
             app.phase = Phase::Chat;
@@ -191,21 +256,9 @@ fn build(state: &str, level: ColorLevel, t: u64) -> App {
             app.help = true;
             app.help_at = t.saturating_sub(900);
         }
-        "idle" => {
-            app.phase = Phase::Chat;
-            app.items = vec![Item::Assistant {
-                text: "Ready. What are we working on?".into(),
-                born: 0,
-                streaming: false,
-                finished: 100,
-            }];
-            app.status.tokens_in = 0;
-            app.status.tokens_out = 0;
-            app.status.cost = 0.0;
-            app.status.cost_flash = 0;
-        }
         other => {
             eprintln!("unknown dump state: {other}");
+            eprintln!("states: {}", STATES.join(" "));
         }
     }
     app
@@ -265,15 +318,14 @@ fn color_sgr(color: Color, bg: bool) -> String {
     match color {
         Color::Rgb(r, g, b) => format!("{};2;{};{};{}", base + 8, r, g, b),
         Color::Indexed(i) => format!("{};5;{}", base + 8, i),
-        Color::Black => format!("{}", base + 0),
+        Color::Black => format!("{}", base),
         Color::Red => format!("{}", base + 1),
         Color::Green => format!("{}", base + 2),
         Color::Yellow => format!("{}", base + 3),
         Color::Blue => format!("{}", base + 4),
         Color::Magenta => format!("{}", base + 5),
         Color::Cyan => format!("{}", base + 6),
-        Color::Gray => format!("{}", base + 7),
-        Color::White => format!("{}", base + 7),
+        Color::Gray | Color::White => format!("{}", base + 7),
         Color::DarkGray => "90".to_string(),
         Color::LightRed => "91".to_string(),
         Color::LightGreen => "92".to_string(),
