@@ -87,6 +87,10 @@ pub fn body(turn: &Turn) -> Value {
     if !declarations.is_empty() {
         body["tools"] = json!([{ "functionDeclarations": declarations }]);
     }
+    // Gemini 2.x takes a thinking budget, and turns reasoning off with zero.
+    if let Some(thinking) = turn.thinking {
+        body["generationConfig"]["thinkingConfig"] = json!({ "thinkingBudget": thinking.budget });
+    }
     body
 }
 
@@ -232,6 +236,7 @@ mod tests {
             messages: &[],
             tools: &[],
             max_tokens: 100,
+            thinking: None,
         };
         let req = Gemini.build(&p, &t);
         assert!(req.url.ends_with("/models/gemini-2.5-pro:streamGenerateContent?alt=sse"), "{}", req.url);

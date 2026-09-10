@@ -109,6 +109,14 @@ pub fn body(provider: &Provider, turn: &Turn, stream: bool) -> Value {
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
+    // Anthropic reasons against an explicit budget, and refuses one that
+    // leaves no room for the answer.
+    if let Some(thinking) = turn.thinking {
+        body["thinking"] = json!({
+            "type": "enabled",
+            "budget_tokens": thinking.budget.min(turn.max_tokens.saturating_sub(1_024)).max(1_024),
+        });
+    }
     body
 }
 
@@ -302,6 +310,29 @@ mod tests {
     }
 
     #[test]
+    fn thinking_level_becomes_a_budget_that_leaves_room() {
+        let provider = Provider {
+            name: "a".into(),
+            kind: crate::config::Kind::Anthropic,
+            base_url: "https://api.anthropic.com".into(),
+            api_key: "k".into(),
+            models: Vec::new(),
+        };
+        let t = Turn {
+            model: "claude-sonnet-4-5",
+            system: "s",
+            messages: &[],
+            tools: &[],
+            max_tokens: 8_192,
+            thinking: super::super::Thinking::new(super::super::Level::Max, 8_192),
+        };
+        let body = body(&provider, &t, true);
+        assert_eq!(body["thinking"]["type"], json!("enabled"));
+        assert_eq!(body["thinking"]["budget_tokens"], json!(8_192 - 1_024));
+        assert!(body["max_tokens"].as_u64().unwrap() > body["thinking"]["budget_tokens"].as_u64().unwrap());
+    }
+
+    #[test]
     fn base_url_with_or_without_v1_lands_on_messages() {
         for base in ["https://api.anthropic.com", "https://api.anthropic.com/v1"] {
             let p = Provider {
@@ -317,6 +348,7 @@ mod tests {
                 messages: &[],
                 tools: &[],
                 max_tokens: 10,
+                thinking: None,
             };
             let req = Anthropic::default().build(&p, &t);
             assert!(req.url.ends_with("/v1/messages"), "{}", req.url);

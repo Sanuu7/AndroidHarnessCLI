@@ -91,11 +91,17 @@ fn flush_para(out: &mut Vec<Line<'static>>, para: &mut Vec<String>, theme: &Them
 }
 
 fn push_header(rest: &str, level: usize, theme: &Theme, width: usize) -> Vec<Line<'static>> {
-    let fg = if level <= 1 { theme.accent } else { theme.text };
+    // Headings are warm, the way both pi and opencode colour them, so a long
+    // answer has structure you can see while scrolling.
+    let fg = match level {
+        1 => theme.md_heading,
+        2 => theme::lerp(theme.md_heading, theme.accent, 0.4),
+        _ => theme.accent,
+    };
     let style = Style::default().fg(theme.c(fg)).add_modifier(Modifier::BOLD);
     let mut spans = Vec::new();
-    if level <= 1 {
-        spans.push(Span::styled("▏ ", Style::default().fg(theme.c(theme.accent2))));
+    if level <= 2 {
+        spans.push(Span::styled("▏ ", Style::default().fg(theme.c(theme.md_heading))));
     }
     spans.push(Span::styled(rest.to_string(), style));
     let mut lines = vec![Line::from(spans)];
@@ -303,6 +309,28 @@ pub fn inline(text: &str, theme: &Theme) -> Vec<Span<'static>> {
                 continue;
             }
         }
+        // [label](url): the label in link colour, the target dim after it, so
+        // a link reads as a link without a browser around it.
+        if c == '[' {
+            if let Some((label, url, end)) = link(&chars, i) {
+                push_plain(&mut spans, &mut buf);
+                spans.push(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(theme.c(theme.md_link))
+                        .add_modifier(Modifier::UNDERLINED),
+                ));
+                let short = shorten_url(&url);
+                if !short.is_empty() {
+                    spans.push(Span::styled(
+                        format!(" {short}"),
+                        Style::default().fg(theme.c(theme.faint)),
+                    ));
+                }
+                i = end;
+                continue;
+            }
+        }
         if c == '*' || c == '_' {
             let doubled = i + 1 < chars.len() && chars[i + 1] == c;
             let marker_len = if doubled { 2 } else { 1 };
@@ -329,6 +357,31 @@ pub fn inline(text: &str, theme: &Theme) -> Vec<Span<'static>> {
 
 fn find(chars: &[char], from: usize, needle: char) -> Option<usize> {
     (from..chars.len()).find(|&i| chars[i] == needle)
+}
+
+/// Parse `[label](url)` starting at the `[`. Returns the label, the url, and
+/// the index just past the closing paren.
+fn link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
+    let label_end = find(chars, start + 1, ']')?;
+    if chars.get(label_end + 1) != Some(&'(') {
+        return None;
+    }
+    let url_end = find(chars, label_end + 2, ')')?;
+    let label: String = chars[start + 1..label_end].iter().collect();
+    let url: String = chars[label_end + 2..url_end].iter().collect();
+    if label.is_empty() {
+        return None;
+    }
+    Some((label, url, url_end + 1))
+}
+
+/// Long links are noise on a phone: keep the host and trim the rest.
+fn shorten_url(url: &str) -> String {
+    let short = url.trim_start_matches("https://").trim_start_matches("http://");
+    if short.chars().count() <= 32 {
+        return short.to_string();
+    }
+    short.chars().take(30).collect::<String>() + "…"
 }
 
 /// Finds the closing run of the same marker char, skipping the opening run.

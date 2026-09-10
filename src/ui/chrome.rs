@@ -38,13 +38,27 @@ pub fn header(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
+    // Where the work is happening, with the branch when there is one, the
+    // way pi's footer shows pwd and branch together.
     let left_w = 10;
-    let right = format!("{} ", app.status.workspace);
+    let mut where_ = app.status.workspace.clone();
+    if !app.status.branch.is_empty() {
+        where_.push_str(&format!(" ({})", app.status.branch));
+    }
+    let right = format!("{where_} ");
     let right = truncate(&right, w.saturating_sub(left_w + 2));
     let right_w = width(&right);
     let pad = w.saturating_sub(left_w).saturating_sub(right_w);
     spans.push(Span::raw(" ".repeat(pad)));
-    spans.push(Span::styled(right, Style::default().fg(t.c(t.faint))));
+    // The branch is the part worth reading, so it stays bright.
+    let (name, branch) = match right.split_once(" (") {
+        Some((name, branch)) => (name.to_string(), Some(branch.trim_end_matches(") ").trim().to_string())),
+        None => (right.trim_end().to_string(), None),
+    };
+    spans.push(Span::styled(name, Style::default().fg(t.c(t.faint))));
+    if let Some(branch) = branch {
+        spans.push(Span::styled(format!(" ({branch})"), Style::default().fg(t.c(t.dim))));
+    }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -133,10 +147,20 @@ pub fn status(frame: &mut Frame, area: Rect, app: &App) {
         left.push(Span::styled("· ", Style::default().fg(t.c(dot))));
     }
     left.push(Span::styled(s.model.clone(), Style::default().fg(t.c(t.dim))));
-    if !s.provider.is_empty() && w >= WIDE as usize {
+
+    // The thinking level rides next to the model, tinted by how hard it is
+    // working, the way pi puts it on the right of its footer.
+    let level_ink = theme::thinking_color(s.thinking);
+    if s.thinking.is_off() {
         left.push(Span::styled(
-            format!(" · {}", s.provider),
-            Style::default().fg(t.c(t.faint)),
+            " • off".to_string(),
+            Style::default().fg(t.fade(theme::THINK_OFF, 0.9)),
+        ));
+    } else {
+        left.push(Span::styled(" • ".to_string(), Style::default().fg(t.c(t.faint))));
+        left.push(Span::styled(
+            s.thinking.as_str().to_string(),
+            Style::default().fg(t.c(level_ink)).add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -147,7 +171,18 @@ pub fn status(frame: &mut Frame, area: Rect, app: &App) {
     let compact = w < WIDE as usize;
 
     let mut right: Vec<Span> = Vec::new();
-    if w >= MID as usize {
+    let show = |group: u8| -> bool {
+        // Width tiers, so nothing has to be dropped after the fact.
+        let room = w.saturating_sub(left.iter().map(|s| width(&s.content)).sum::<usize>() + 1);
+        let needed = match group {
+            3 => 34, // tokens + cache + meter + cost
+            2 => 26, // tokens + meter + cost
+            1 => 18, // meter + cost
+            _ => 8,  // cost
+        };
+        room >= needed
+    };
+    if show(2) {
         right.push(Span::styled(
             format!(
                 "↑{} ↓{}  ",
@@ -157,13 +192,29 @@ pub fn status(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(t.c(t.faint)),
         ));
     }
+    // Cache traffic, when the provider reported any.
+    if show(3) && (s.cache_read > 0 || s.cache_write > 0) {
+        let hit = s.cache_hit_pct().unwrap_or(0);
+        let color = if hit >= 50 { t.green } else { t.amber };
+        right.push(Span::styled(
+            format!("R{} {hit}%  ", short_num(s.cache_read)),
+            Style::default().fg(t.c(color)),
+        ));
+    }
     let frac = s.ctx_frac(now);
     let pct = s.ctx_pct(now);
-    if w >= 30 {
-        let cells = if compact { 4 } else { 6 };
+    if show(1) {
+        let cells = if w < WIDE as usize { 4 } else { 6 };
         right.extend(ctx_meter(frac, cells, t));
         right.push(Span::raw(" ".to_string()));
-        let ctx_color = if pct > 80 { t.amber } else { t.faint };
+        // Colour it before it becomes a problem, not after.
+        let ctx_color = if pct > 90 {
+            t.red
+        } else if pct > 70 {
+            t.amber
+        } else {
+            t.faint
+        };
         right.push(Span::styled(
             format!("{pct}%  "),
             Style::default().fg(t.c(ctx_color)),
@@ -181,16 +232,11 @@ pub fn status(frame: &mut Frame, area: Rect, app: &App) {
     ));
 
     let mut left_w: usize = left.iter().map(|s| width(&s.content)).sum();
-    let mut right_w: usize = right.iter().map(|s| width(&s.content)).sum();
-    // On a narrow phone the two halves can collide; keep at least one column
-    // of air between them, dropping the token counters first and clipping the
-    // model label after that.
-    while left_w + right_w + 1 > w && right.len() > 2 {
-        right.remove(0);
-        right_w = right.iter().map(|s| width(&s.content)).sum();
-    }
+    let right_w: usize = right.iter().map(|s| width(&s.content)).sum();
+    // On a narrow phone the two halves can collide. The model label is the
+    // part that gives way; the thinking level is one word and stays.
     if left_w + right_w + 1 > w {
-        if let Some(model) = left.last_mut() {
+        if let Some(model) = left.get_mut(1) {
             let room = w.saturating_sub(right_w + 2);
             let text = truncate(&model.content, room);
             model.content = text.into();

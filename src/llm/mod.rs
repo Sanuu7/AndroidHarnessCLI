@@ -15,6 +15,134 @@ pub mod responses;
 use crate::config::{Kind, Provider};
 use serde_json::{Value, json};
 
+/// How hard the model should think before answering.
+///
+/// Same vocabulary pi and opencode use, so the levels mean the same thing
+/// across providers. Each wire maps them the way it can: a token budget for
+/// Anthropic and Gemini, an effort name for OpenAI-shaped APIs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Level {
+    Off,
+    Minimal,
+    Low,
+    #[default]
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl Level {
+    pub fn all() -> [Level; 7] {
+        [Level::Off, Level::Minimal, Level::Low, Level::Medium, Level::High, Level::XHigh, Level::Max]
+    }
+
+    /// Levels that make sense when the model has no reasoning at all.
+    pub fn is_off(self) -> bool {
+        self == Level::Off
+    }
+
+    pub fn parse(s: &str) -> Option<Level> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "disabled" => Level::Off,
+            "minimal" | "min" => Level::Minimal,
+            "low" => Level::Low,
+            "medium" | "med" | "default" | "on" => Level::Medium,
+            "high" => Level::High,
+            "xhigh" | "x-high" | "extra" => Level::XHigh,
+            "max" | "maximum" => Level::Max,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Level::Off => "off",
+            Level::Minimal => "minimal",
+            Level::Low => "low",
+            Level::Medium => "medium",
+            Level::High => "high",
+            Level::XHigh => "xhigh",
+            Level::Max => "max",
+        }
+    }
+
+    /// Setting another level with one key press.
+    pub fn next(self) -> Level {
+        match self {
+            Level::Off => Level::Minimal,
+            Level::Minimal => Level::Low,
+            Level::Low => Level::Medium,
+            Level::Medium => Level::High,
+            Level::High => Level::XHigh,
+            Level::XHigh => Level::Max,
+            Level::Max => Level::Off,
+        }
+    }
+
+    /// Default token budget per level, in pi's numbers.
+    pub fn budget(self) -> u32 {
+        match self {
+            Level::Off => 0,
+            Level::Minimal => 1_024,
+            Level::Low => 2_048,
+            Level::Medium => 8_192,
+            Level::High => 16_384,
+            Level::XHigh => 32_768,
+            Level::Max => 65_536,
+        }
+    }
+
+    /// The effort name OpenAI-shaped APIs take. Levels they do not know are
+    /// clamped rather than dropped, the way pi clamps xhigh and max.
+    pub fn effort(self) -> Option<&'static str> {
+        Some(match self {
+            Level::Off => return None,
+            Level::Minimal => "minimal",
+            Level::Low => "low",
+            Level::Medium => "medium",
+            Level::High | Level::XHigh | Level::Max => "high",
+        })
+    }
+
+    /// One line explaining what the level does, for the picker.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Level::Off => "no reasoning",
+            Level::Minimal => "barely any reasoning (~1k tokens)",
+            Level::Low => "light reasoning (~2k tokens)",
+            Level::Medium => "moderate reasoning (~8k tokens)",
+            Level::High => "deep reasoning (~16k tokens)",
+            Level::XHigh => "deeper still (~32k tokens)",
+            Level::Max => "as much as it wants",
+        }
+    }
+}
+
+/// What the request should ask for, if anything.
+#[derive(Clone, Copy, Debug)]
+pub struct Thinking {
+    pub level: Level,
+    /// Token budget, already trimmed to leave room for the answer.
+    pub budget: u32,
+}
+
+impl Thinking {
+    pub fn new(level: Level, max_tokens: u32) -> Option<Thinking> {
+        if level.is_off() {
+            return None;
+        }
+        // Keep at least a kilobyte of tokens for the answer itself, which is
+        // what both pi and the Anthropic API require.
+        let room = max_tokens.saturating_sub(MIN_ANSWER_TOKENS);
+        let budget = level.budget().min(room.max(1_024));
+        Some(Thinking { level, budget })
+    }
+}
+
+/// Answer room that must survive whatever the thinking budget takes.
+pub const MIN_ANSWER_TOKENS: u32 = 1_024;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     User,
@@ -115,6 +243,8 @@ pub struct Turn<'a> {
     pub messages: &'a [Msg],
     pub tools: &'a [ToolSchema],
     pub max_tokens: u32,
+    /// None when the model should not reason at all.
+    pub thinking: Option<Thinking>,
 }
 
 pub trait Wire: Send {
@@ -229,5 +359,39 @@ mod tests {
         assert_eq!(msg.call_id, "c1");
         assert_eq!(msg.name, "bash");
         assert_eq!(msg.role, Role::Tool);
+    }
+
+    #[test]
+    fn levels_parse_and_cycle() {
+        assert_eq!(Level::parse("HIGH"), Some(Level::High));
+        assert_eq!(Level::parse("x-high"), Some(Level::XHigh));
+        assert_eq!(Level::parse("nope"), None);
+        for level in Level::all() {
+            assert_eq!(Level::parse(level.as_str()), Some(level));
+        }
+        let mut level = Level::Off;
+        for expected in
+            [Level::Minimal, Level::Low, Level::Medium, Level::High, Level::XHigh, Level::Max, Level::Off]
+        {
+            level = level.next();
+            assert_eq!(level, expected);
+        }
+    }
+
+    #[test]
+    fn effort_clamps_to_what_apis_know() {
+        assert_eq!(Level::Off.effort(), None);
+        assert_eq!(Level::Medium.effort(), Some("medium"));
+        assert_eq!(Level::XHigh.effort(), Some("high"), "unknown levels clamp, not break");
+        assert_eq!(Level::Max.effort(), Some("high"));
+    }
+
+    #[test]
+    fn budgets_leave_room_for_the_answer() {
+        let thinking = Thinking::new(Level::Max, 8_192).unwrap();
+        assert_eq!(thinking.budget, 8_192 - MIN_ANSWER_TOKENS);
+        let roomy = Thinking::new(Level::Low, 100_000).unwrap();
+        assert_eq!(roomy.budget, 2_048);
+        assert!(Thinking::new(Level::Off, 8_192).is_none());
     }
 }

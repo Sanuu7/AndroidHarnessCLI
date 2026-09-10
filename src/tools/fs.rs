@@ -207,13 +207,19 @@ fn write_file(ctx: &mut Ctx, args: &Value) -> Result<String, String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", ctx.display(dir)))?;
     }
+    let existed = fs::read_to_string(&path).ok();
     fs::write(&path, &content).map_err(|e| format!("{}: {e}", ctx.display(&path)))?;
-    Ok(format!(
-        "wrote {} ({} bytes, {} lines)",
-        ctx.display(&path),
-        content.len(),
-        content.lines().count()
-    ))
+    let name = ctx.display(&path);
+    match existed {
+        // Overwriting is an edit, and an edit should show what it did.
+        Some(before) if before != content => Ok(edit_report(&name, &before, &content, 1)),
+        Some(_) => Ok(format!("wrote {name} (unchanged)")),
+        None => Ok(format!(
+            "created {name} ({} bytes, {} lines)",
+            content.len(),
+            content.lines().count()
+        )),
+    }
 }
 
 /// Apply one text replacement, exact first and line-trimmed as a fallback.
@@ -279,7 +285,7 @@ fn edit_file(ctx: &mut Ctx, args: &Value) -> Result<String, String> {
     let source = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", ctx.display(&path)))?;
     let (updated, n) = replace_block(&source, &old, &new, all)?;
     fs::write(&path, &updated).map_err(|e| format!("{}: {e}", ctx.display(&path)))?;
-    Ok(format!("edited {} ({n} replacement{})", ctx.display(&path), if n == 1 { "" } else { "s" }))
+    Ok(edit_report(&ctx.display(&path), &source, &updated, n))
 }
 
 fn multi_edit(ctx: &mut Ctx, args: &Value) -> Result<String, String> {
@@ -288,18 +294,36 @@ fn multi_edit(ctx: &mut Ctx, args: &Value) -> Result<String, String> {
         .get("edits")
         .and_then(|e| e.as_array())
         .ok_or("edits must be an array")?;
-    let mut source = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", ctx.display(&path)))?;
+    let source = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", ctx.display(&path)))?;
+    let mut updated = source.clone();
     let mut applied = 0usize;
     for (i, edit) in edits.iter().enumerate() {
         let old = str_req(edit, "old").map_err(|e| format!("edit {}: {e}", i + 1))?;
         let new = str_arg(edit, "new").unwrap_or_default();
-        let (updated, n) = replace_block(&source, &old, &new, false)
+        let (next, n) = replace_block(&updated, &old, &new, false)
             .map_err(|e| format!("edit {}: {e}", i + 1))?;
-        source = updated;
+        updated = next;
         applied += n;
     }
-    fs::write(&path, &source).map_err(|e| format!("{}: {e}", ctx.display(&path)))?;
-    Ok(format!("edited {} ({applied} replacements)", ctx.display(&path)))
+    fs::write(&path, &updated).map_err(|e| format!("{}: {e}", ctx.display(&path)))?;
+    Ok(edit_report(&ctx.display(&path), &source, &updated, applied))
+}
+
+/// Every write is reported as what changed, not just that something did.
+/// Counts lead the line so a truncated preview still says how big the change
+/// was, and the diff lines carry their numbers for the transcript to colour.
+fn edit_report(path: &str, before: &str, after: &str, replacements: usize) -> String {
+    let lines = crate::diff::unified(before, after, 2);
+    let (added, removed) = crate::diff::counts(&lines);
+    if added == 0 && removed == 0 {
+        return format!("+0 -0  {path} ({replacements} replacements, no net change)");
+    }
+    let mut out = format!("+{added} -{removed}  edited {path}\n");
+    for line in &lines {
+        out.push_str(&line.to_text());
+        out.push('\n');
+    }
+    out.trim_end().to_string()
 }
 
 fn list_dir(ctx: &mut Ctx, args: &Value) -> Result<String, String> {
@@ -635,7 +659,9 @@ mod tests {
             &json!({"path": "src/x.rs", "old": "fn main() {}", "new": "fn main() { run() }"}),
         )
         .unwrap();
-        assert!(out.contains("edited"));
+        assert!(out.starts_with("+1 -1"), "{out}");
+        assert!(out.contains("-1 fn main() {}"), "the diff shows both sides: {out}");
+        assert!(out.contains("+1 fn main() { run() }"), "{out}");
         let text = fs::read_to_string(dir.join("src/x.rs")).unwrap();
         assert_eq!(text, "fn main() { run() }\n");
     }

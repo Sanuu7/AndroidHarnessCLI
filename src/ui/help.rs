@@ -16,13 +16,15 @@ const KEYS: &[(&str, &str)] = &[
     ("tab", "complete command"),
     ("type /", "commands and pickers"),
     ("up / down", "history or list"),
-    ("pgup / pgdn", "scroll back"),
+    ("shift+tab", "cycle thinking level"),
+    ("ctrl+t", "show or hide thinking"),
+    ("ctrl+o", "expand tool output"),
     ("ctrl+e", "expand last tool"),
-    ("ctrl+o", "expand everything"),
+    ("pgup / pgdn", "scroll back"),
     ("ctrl+w", "delete word"),
     ("ctrl+u", "clear input"),
+    ("ctrl+s", "save in a picker"),
     ("ctrl+c", "cancel, twice to quit"),
-    ("ctrl+l", "redraw"),
     ("esc", "close"),
 ];
 

@@ -24,6 +24,55 @@ pub const AMBER: Rgb = (251, 191, 36);
 pub const CODE_BG: Rgb = (26, 34, 48);
 pub const CARD_BG: Rgb = (21, 27, 38);
 
+/// A background for something the user said, so turns have anchors.
+pub const USER_BG: Rgb = (34, 36, 48);
+
+/// Tool cards are tinted by what happened, not just marked (pi's toolBg set).
+pub const TOOL_PENDING_BG: Rgb = (30, 34, 44);
+pub const TOOL_SUCCESS_BG: Rgb = (26, 38, 32);
+pub const TOOL_ERROR_BG: Rgb = (44, 30, 32);
+
+/// Markdown accents: headings warm, links cool, code in the accent.
+pub const MD_HEADING: Rgb = (240, 198, 116);
+pub const MD_LINK: Rgb = (129, 162, 190);
+
+/// Reasoning levels get their own ramp so the footer and the thinking block
+/// say how hard the model is working at a glance.
+pub const THINK_OFF: Rgb = (88, 96, 110);
+pub const THINK_MINIMAL: Rgb = (122, 128, 140);
+pub const THINK_LOW: Rgb = (95, 135, 175);
+pub const THINK_MEDIUM: Rgb = (129, 162, 190);
+pub const THINK_HIGH: Rgb = (178, 148, 187);
+pub const THINK_XHIGH: Rgb = (209, 131, 232);
+pub const THINK_MAX: Rgb = (236, 120, 236);
+
+pub fn thinking_color(level: crate::llm::Level) -> Rgb {
+    use crate::llm::Level;
+    match level {
+        Level::Off => THINK_OFF,
+        Level::Minimal => THINK_MINIMAL,
+        Level::Low => THINK_LOW,
+        Level::Medium => THINK_MEDIUM,
+        Level::High => THINK_HIGH,
+        Level::XHigh => THINK_XHIGH,
+        Level::Max => THINK_MAX,
+    }
+}
+
+/// One character per level, for the meter next to the model name.
+pub fn thinking_ramp(level: crate::llm::Level) -> usize {
+    use crate::llm::Level;
+    match level {
+        Level::Off => 0,
+        Level::Minimal => 1,
+        Level::Low => 2,
+        Level::Medium => 3,
+        Level::High => 4,
+        Level::XHigh => 5,
+        Level::Max => 6,
+    }
+}
+
 /// Best guess at the terminal background, used to fade things "in" from
 /// nothing. Override with HARNESS_BG=rrggbb when running on a light theme.
 fn guess_bg() -> Rgb {
@@ -85,6 +134,12 @@ pub struct Theme {
     pub amber: Rgb,
     pub code_bg: Rgb,
     pub card_bg: Rgb,
+    pub user_bg: Rgb,
+    pub tool_pending_bg: Rgb,
+    pub tool_success_bg: Rgb,
+    pub tool_error_bg: Rgb,
+    pub md_heading: Rgb,
+    pub md_link: Rgb,
     pub bg: Rgb,
 }
 
@@ -102,6 +157,12 @@ impl Default for Theme {
             amber: AMBER,
             code_bg: CODE_BG,
             card_bg: CARD_BG,
+            user_bg: USER_BG,
+            tool_pending_bg: TOOL_PENDING_BG,
+            tool_success_bg: TOOL_SUCCESS_BG,
+            tool_error_bg: TOOL_ERROR_BG,
+            md_heading: MD_HEADING,
+            md_link: MD_LINK,
             bg: guess_bg(),
         }
     }

@@ -72,6 +72,9 @@ pub fn body(turn: &Turn) -> Value {
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
+    if let Some(effort) = turn.thinking.and_then(|t| t.level.effort()) {
+        body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
+    }
     body
 }
 

@@ -19,6 +19,8 @@ use ratatui::widgets::Paragraph;
 const USER_INDENT: usize = 5;
 const BODY_INDENT: usize = 2;
 const CARD_INDENT: usize = 4;
+/// Expanded tool output stops here; a transcript is not a file viewer.
+const MAX_CARD_LINES: usize = 40;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     if app.is_empty_state() {
@@ -197,9 +199,10 @@ fn item_lines(item: &Item, app: &App, w: usize, scale: f32) -> Vec<Line<'static>
     }
 }
 
-/// Reasoning is context, not the answer. While it streams it shows the tail
-/// with a breathing gutter; once the answer starts it collapses to one quiet
-/// line, so a finished turn is not half thinking.
+/// Reasoning is not the answer: while it streams it shows the tail with a
+/// spinner header, and once the answer starts it collapses to one line that
+/// says how long it thought. ctrl+t opens it again (pi's thinking toggle,
+/// opencode's "Thought · 12s" line).
 fn reasoning_lines(
     app: &App,
     text: &str,
@@ -209,54 +212,88 @@ fn reasoning_lines(
     alpha: f32,
 ) -> Vec<Line<'static>> {
     let t = &app.theme;
-    if finished > 0 && !app.expand {
+    let ink = theme::thinking_color(app.status.thinking);
+    let open = app.thinking_open || app.expand;
+    if finished > 0 && !open {
         let secs = (finished.saturating_sub(born)) as f32 / 1000.0;
-        let label = if secs >= 1.0 {
-            format!("thought for {secs:.0}s")
-        } else {
-            "thought for a moment".to_string()
-        };
-        return vec![Line::from(vec![
+        let mut spans = vec![
             Span::raw(" ".repeat(BODY_INDENT)),
+            Span::styled("│ ".to_string(), Style::default().fg(t.fade(ink, alpha * 0.5))),
             Span::styled(
-                "│ ".to_string(),
-                Style::default().fg(t.fade(t.faint, alpha * 0.5)),
-            ),
-            Span::styled(
-                label,
+                "Thought".to_string(),
                 Style::default()
-                    .fg(t.fade(t.faint, alpha * 0.8))
+                    .fg(t.fade(ink, alpha * 0.9))
                     .add_modifier(Modifier::ITALIC),
             ),
-        ])];
+        ];
+        if secs >= 1.0 {
+            spans.push(Span::styled(
+                format!(" · {secs:.0}s"),
+                Style::default().fg(t.fade(t.faint, alpha * 0.9)),
+            ));
+        }
+        if !app.status.thinking.is_off() {
+            spans.push(Span::styled(
+                format!(" · {}", app.status.thinking.as_str()),
+                Style::default().fg(t.fade(ink, alpha * 0.7)),
+            ));
+        }
+        return vec![Line::from(spans)];
     }
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let header = if finished > 0 {
+        // Open, and no longer arriving: a plain label.
+        Line::from(vec![
+            Span::raw(" ".repeat(BODY_INDENT)),
+            Span::styled(
+                "Thought".to_string(),
+                Style::default()
+                    .fg(t.fade(ink, alpha * 0.9))
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw(" ".repeat(BODY_INDENT)),
+            Span::styled(
+                format!("{} ", anim::spinner(app.now)),
+                Style::default().fg(t.fade(t.amber, alpha)),
+            ),
+            Span::styled(
+                "Thinking".to_string(),
+                Style::default().fg(t.fade(ink, alpha)),
+            ),
+        ])
+    };
+    out.push(header);
 
     let budget = w.saturating_sub(BODY_INDENT + 2).max(8);
     let flat = text.replace('\n', " ");
     let rows = wrap(&flat, budget);
-    let shown = if app.expand { rows.len() } else { rows.len().min(3) };
+    let shown = if open { rows.len() } else { rows.len().min(3) };
     let start = rows.len().saturating_sub(shown);
-    let mut out: Vec<Line<'static>> = Vec::new();
-    // A breathing dot marks the stream while it is still arriving.
+    // A breathing gutter marks the stream while it is still arriving.
     let pulse = anim::breathe(app.now, 1100);
-    let color = theme::lerp(t.faint, t.accent2, pulse * 0.35);
-    for (i, row) in rows[start..].iter().enumerate() {
-        let mut spans = vec![Span::raw(" ".repeat(BODY_INDENT))];
-        spans.push(Span::styled(
-            if i == 0 { "│ " } else { "  " }.to_string(),
-            Style::default().fg(t.fade(color, alpha * 0.8)),
-        ));
-        spans.push(Span::styled(
-            row.clone(),
-            Style::default()
-                .fg(t.fade(t.faint, alpha * 0.9))
-                .add_modifier(Modifier::ITALIC),
-        ));
-        out.push(Line::from(spans));
+    let color = theme::lerp(ink, t.accent2, pulse * 0.25);
+    for row in rows[start..].iter() {
+        out.push(Line::from(vec![
+            Span::raw(" ".repeat(BODY_INDENT)),
+            Span::styled(
+                "│ ".to_string(),
+                Style::default().fg(t.fade(color, alpha * 0.7)),
+            ),
+            Span::styled(
+                row.clone(),
+                Style::default()
+                    .fg(t.fade(t.faint, alpha * 0.9))
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ]));
     }
     if rows.len() > shown {
         out.insert(
-            0,
+            1,
             Line::from(Span::styled(
                 format!("{}… {} earlier lines", " ".repeat(BODY_INDENT), rows.len() - shown),
                 Style::default().fg(t.fade(t.faint, alpha * 0.6)),
@@ -266,29 +303,41 @@ fn reasoning_lines(
     out
 }
 
+/// The user's own words sit on a tinted block, so a long transcript has
+/// anchors to scroll by (pi gives user messages their own background).
 fn user_lines(text: &str, t: &Theme, w: usize, alpha: f32) -> Vec<Line<'static>> {
     let body_w = w.saturating_sub(USER_INDENT).max(8);
+    let fill = t.c(theme::lerp(t.bg, t.user_bg, 0.75 * alpha));
     let head = vec![
         Span::styled("▌".to_string(), Style::default().fg(t.fade(t.accent, alpha))),
         Span::styled(
             "you".to_string(),
             Style::default()
                 .fg(t.fade(t.dim, alpha))
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(Modifier::BOLD)
+                .bg(fill),
         ),
-        Span::raw(" ".to_string()),
+        Span::styled(" ".to_string(), Style::default().bg(fill)),
     ];
     let mut out = Vec::new();
     for (i, row) in wrap(text, body_w).into_iter().enumerate() {
         let mut spans = if i == 0 {
             head.clone()
         } else {
-            vec![Span::raw(" ".repeat(USER_INDENT))]
+            vec![
+                Span::styled(" ".to_string(), Style::default().bg(fill)),
+                Span::raw(" ".repeat(USER_INDENT - 1)),
+            ]
         };
+        // Pad the row so the tint reaches the edge it started at.
+        let pad = body_w.saturating_sub(width(&row));
         spans.push(Span::styled(
             row,
-            Style::default().fg(t.fade(t.text, alpha)),
+            Style::default().fg(t.fade(t.text, alpha)).bg(fill),
         ));
+        if pad > 0 {
+            spans.push(Span::styled(" ".repeat(pad), Style::default().bg(fill)));
+        }
         out.push(Line::from(spans));
     }
     out
@@ -409,10 +458,11 @@ fn apply_comet(line: &mut Line<'static>, tail: usize, hot: theme::Rgb, gain: f32
 
 fn thinking_lines(app: &App, born: u64, w: usize, alpha: f32) -> Vec<Line<'static>> {
     let t = &app.theme;
-    let label = "thinking";
+    let label = "Thinking";
     let cols = label.chars().count();
     let phase = anim::saw(app.now, 1600);
-    let colors = anim::shimmer_colors(t.dim, t.accent, cols, phase, 2.2);
+    let ink = theme::thinking_color(app.status.thinking);
+    let colors = anim::shimmer_colors(ink, t.accent, cols, phase, 2.2);
     let mut spans = vec![
         Span::raw("  ".to_string()),
         Span::styled(
@@ -440,8 +490,13 @@ fn thinking_lines(app: &App, born: u64, w: usize, alpha: f32) -> Vec<Line<'stati
     for (row, len_frac) in [(0usize, 1.0f32), (1usize, 0.62f32)] {
         let cols = ((w.saturating_sub(CARD_INDENT)) as f32 * len_frac).round() as usize;
         let cols = cols.min(38);
-        let colors =
-            anim::skeleton_colors(cols, (skel_phase + row as f32 * 0.12).fract(), 4.0, t.faint, t.accent);
+        let colors = anim::skeleton_colors(
+            cols,
+            (skel_phase + row as f32 * 0.12).fract(),
+            4.0,
+            t.faint,
+            ink,
+        );
         let mut s = vec![Span::raw(" ".repeat(BODY_INDENT))];
         for color in colors {
             s.push(Span::styled(
@@ -452,6 +507,92 @@ fn thinking_lines(app: &App, born: u64, w: usize, alpha: f32) -> Vec<Line<'stati
         out.push(Line::from(s));
     }
     out
+}
+
+/// What a running tool is doing, in the present tense (opencode's idea).
+fn tool_gerund(name: &str) -> &'static str {
+    match name {
+        "shell" => "running",
+        "shell_background" => "starting",
+        "bg_list" => "checking jobs",
+        "bg_kill" => "stopping",
+        "read_file" => "reading",
+        "write_file" => "writing",
+        "edit_file" | "multi_edit" => "editing",
+        "create_dir" => "creating",
+        "delete_file" => "deleting",
+        "move_file" => "moving",
+        "list_dir" => "listing",
+        "file_info" => "checking",
+        "search_files" => "finding files",
+        "grep" => "searching",
+        "web_fetch" => "fetching",
+        "web_search" => "searching the web",
+        "http_request" => "requesting",
+        "memory_read" | "memory_write" | "memory_search" => "remembering",
+        "todo_write" => "updating the list",
+        "skills_list" | "skill_view" => "checking skills",
+        "doctor" => "checking the tools",
+        "env_status" => "checking the environment",
+        _ if name.starts_with("git_") => "running git",
+        _ => "working",
+    }
+}
+
+/// What a tool call is about, in one line. The raw JSON is for the model,
+/// not for a phone screen: show the path, the command, the pattern.
+fn tool_arg(name: &str, args: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
+        return args.replace('\n', " ");
+    };
+    let pick = |key: &str| v.get(key).and_then(|s| s.as_str()).map(|s| s.to_string());
+    let second = |a: &str, b: &str| pick(a).or_else(|| pick(b));
+    let out = match name {
+        "shell" | "shell_background" => second("command", "cwd"),
+        "grep" | "search_files" => match (pick("pattern"), second("path", "glob")) {
+            (Some(pattern), Some(where_)) => Some(format!("{pattern}  ({where_})")),
+            (Some(pattern), None) => Some(pattern),
+            _ => None,
+        },
+        "web_fetch" | "http_request" => second("url", "method"),
+        "bg_kill" => v.get("id").map(|i| i.to_string()),
+        "todo_write" => v
+            .get("todos")
+            .and_then(|t| t.as_array())
+            .map(|a| format!("{} items", a.len())),
+        "multi_edit" => v
+            .get("edits")
+            .and_then(|e| e.as_array())
+            .and_then(|a| pick("path").map(|p| format!("{p}  ({} edits)", a.len()))),
+        _ => second("path", "topic")
+            .or_else(|| second("query", "from"))
+            .or_else(|| pick("content"))
+            // An unknown tool still shows something useful: its first string
+            // argument.
+            .or_else(|| {
+                v.as_object().and_then(|o| {
+                    o.values().find_map(|value| value.as_str().map(|s| s.to_string()))
+                })
+            }),
+    };
+    out.map(|s| s.replace('\n', " ")).unwrap_or_else(|| args.replace('\n', " "))
+}
+/// A diff line from an edit report: `+12 text`, `-4 text`, ` 7 text`.
+fn diff_kind(line: &str) -> Option<char> {
+    let mut chars = line.chars().peekable();
+    let sign = chars.next()?;
+    if !matches!(sign, '+' | '-' | ' ') {
+        return None;
+    }
+    let mut digits = 0;
+    while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+        chars.next();
+        digits += 1;
+    }
+    if digits == 0 || chars.next() != Some(' ') {
+        return None;
+    }
+    Some(sign)
 }
 
 fn tool_lines(
@@ -485,12 +626,20 @@ fn tool_lines(
             let flash = 1.0 - (now.saturating_sub(*at) as f32 / 500.0).clamp(0.0, 1.0);
             let base = if *ok { t.green } else { t.red };
             (
-                if *ok { t.green } else { t.red },
+                base,
                 format!("{mark} {}", fmt_ms(*ms)),
                 theme::lerp(base, (255, 255, 255), flash * 0.8),
             )
         }
     };
+
+    // The card is tinted by what happened, the way pi colours its tool boxes.
+    let card = match state {
+        ToolState::Running { .. } => t.tool_pending_bg,
+        ToolState::Done { ok: true, .. } => t.tool_success_bg,
+        ToolState::Done { ok: false, .. } => t.tool_error_bg,
+    };
+    let body_bg = Some(t.c(theme::lerp(t.bg, card, 0.55 * alpha)));
 
     // A failed card wobbles for a moment.
     let jitter = match state {
@@ -507,15 +656,17 @@ fn tool_lines(
 
     let status_w = width(&status);
     let left_budget = w.saturating_sub(status_w + 3 + jitter);
+    let arg_line = tool_arg(name, args);
     let mut spans: Vec<Span> = Vec::new();
     if jitter > 0 {
         spans.push(Span::raw(" ".repeat(jitter)));
     }
     spans.push(Span::styled(
-        "▎".to_string(),
+        "▍".to_string(),
         Style::default().fg(t.fade(gutter_color, alpha)),
     ));
     if matches!(state, ToolState::Running { .. }) {
+        // Spinner plus a present-tense verb, so the wait explains itself.
         spans.push(Span::styled(
             format!("{} ", anim::spinner(now)),
             Style::default().fg(t.fade(t.amber, alpha)),
@@ -528,8 +679,13 @@ fn tool_lines(
     } else {
         spans.push(Span::raw("  "));
     }
+    let label = if matches!(state, ToolState::Running { .. }) {
+        format!("{} {name}", tool_gerund(name))
+    } else {
+        name.to_string()
+    };
     spans.push(Span::styled(
-        name.to_string(),
+        label,
         Style::default()
             .fg(t.fade(t.text, alpha))
             .add_modifier(Modifier::BOLD),
@@ -541,21 +697,25 @@ fn tool_lines(
             " · ".to_string(),
             Style::default().fg(t.fade(t.faint, alpha)),
         ));
+        // Arguments are shown as the one thing they are about: a phone row is
+        // not the place for a pretty printed JSON object.
         spans.push(Span::styled(
-            truncate(args, arg_budget),
+            truncate(&arg_line, arg_budget),
             Style::default().fg(t.fade(t.dim, alpha)),
         ));
     }
     let used: usize = spans.iter().map(|s| width(&s.content)).sum();
     let pad = w.saturating_sub(used + status_w + 1);
-    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled(" ".repeat(pad), Style::default().bg(body_bg.unwrap_or_default())));
     spans.push(Span::styled(
         status,
-        Style::default().fg(t.fade(status_color, alpha)),
+        Style::default()
+            .fg(t.fade(status_color, alpha))
+            .bg(body_bg.unwrap_or_default()),
     ));
     let mut out = vec![Line::from(spans)];
 
-    // Collapsed cards keep one line of result visible: the useful part.
+    let inner_w = w.saturating_sub(CARD_INDENT + 2).max(4);
     match (expanded, output) {
         (false, Some(text)) if has_body => {
             // The first line that says something: tool output often starts
@@ -571,23 +731,31 @@ fn tool_lines(
             let budget = w.saturating_sub(CARD_INDENT + 2);
             shown = truncate(&shown, budget);
             if more && width(&shown) < budget {
-                shown.push(' ');
-                shown.push('…');
+                shown.push_str(" …");
             }
             out.push(Line::from(vec![
                 Span::raw(" ".repeat(CARD_INDENT)),
-                Span::styled(shown, Style::default().fg(t.fade(t.faint, alpha))),
+                Span::styled(
+                    shown,
+                    Style::default().fg(t.fade(t.faint, alpha)).bg(body_bg.unwrap_or_default()),
+                ),
             ]));
         }
         (true, Some(text)) => {
             let reveal_tween = Tween::new(240, anim::Ease::OutCubic);
             let reveal = reveal_tween.t(now, expand_at);
-            let mut body: Vec<&str> = vec![];
-            body.extend(text.split('\n'));
+            let body: Vec<&str> = text.split('\n').collect();
             let total = body.len();
-            let shown = anim::reveal_lines(body.len().min(10), reveal);
-            let inner_w = w.saturating_sub(CARD_INDENT + 2).max(4);
+            let shown = anim::reveal_lines(body.len().min(MAX_CARD_LINES), reveal);
             for line in body.iter().take(shown) {
+                // Diff lines carry their own colour: red out, green in.
+                let ink = match diff_kind(line) {
+                    Some('+') => t.green,
+                    Some('-') => t.red,
+                    Some(_) => t.faint,
+                    None if line.trim() == "…" => t.faint,
+                    None => t.dim,
+                };
                 for (i, row) in wrap(line, inner_w).into_iter().enumerate() {
                     let lead = if i == 0 { CARD_INDENT } else { CARD_INDENT + 2 };
                     out.push(Line::from(vec![
@@ -595,17 +763,20 @@ fn tool_lines(
                         Span::styled(
                             pad_right(&row, inner_w),
                             Style::default()
-                                .fg(t.fade(t.dim, alpha))
-                                .bg(t.c(t.card_bg)),
+                                .fg(t.fade(ink, alpha))
+                                .bg(body_bg.unwrap_or_default()),
                         ),
                     ]));
                 }
             }
-            if reveal_tween.done(now, expand_at) && total > 10 {
-                out.push(Line::from(Span::styled(
-                    format!("{}… {} more lines", " ".repeat(CARD_INDENT), total - 10),
-                    Style::default().fg(t.fade(t.faint, alpha)),
-                )));
+            if reveal_tween.done(now, expand_at) && total > MAX_CARD_LINES {
+                out.push(Line::from(vec![
+                    Span::raw(" ".repeat(CARD_INDENT)),
+                    Span::styled(
+                        format!("… {} more lines", total - MAX_CARD_LINES),
+                        Style::default().fg(t.fade(t.faint, alpha)),
+                    ),
+                ]));
             }
         }
         _ => {}
@@ -813,8 +984,55 @@ mod tests {
     fn thinking_draws_skeleton() {
         let app = app_with(vec![Item::Thinking { born: 4_000 }]);
         let out = render(&app, 44, 8);
-        assert!(out.contains("thinking"));
+        assert!(out.contains("Thinking"), "{out}");
         assert!(out.contains("▁"), "skeleton rows should be drawn");
+    }
+
+    #[test]
+    fn tool_args_show_what_they_are_about() {
+        assert_eq!(tool_arg("shell", r#"{"command":"git status"}"#), "git status");
+        assert_eq!(tool_arg("read_file", r#"{"path":"src/main.rs"}"#), "src/main.rs");
+        assert_eq!(
+            tool_arg("grep", r#"{"pattern":"fn main","path":"src"}"#),
+            "fn main  (src)"
+        );
+        assert_eq!(tool_arg("web_fetch", r#"{"url":"https://example.com"}"#), "https://example.com");
+        // Anything unrecognised falls back to the raw arguments rather than
+        // showing nothing at all.
+        assert_eq!(tool_arg("mystery", r#"{"odd":"value"}"#), "value");
+        assert_eq!(tool_arg("mystery", "not json"), "not json");
+    }
+
+    #[test]
+    fn diff_lines_are_recognized() {
+        assert_eq!(diff_kind("+12 hello"), Some('+'));
+        assert_eq!(diff_kind("-4 gone"), Some('-'));
+        assert_eq!(diff_kind(" 7 same"), Some(' '));
+        assert_eq!(diff_kind("plain text"), None);
+        assert_eq!(diff_kind("+nope"), None);
+        assert_eq!(diff_kind("…"), None);
+    }
+
+    #[test]
+    fn a_finished_answer_keeps_one_thought_line() {
+        let mut app = app_with(vec![
+            Item::Reasoning { text: "weighing options".into(), born: 0, finished: 2_500 },
+            Item::Assistant {
+                text: "here is the answer".into(),
+                born: 2_500,
+                streaming: false,
+                finished: 3_000,
+            },
+        ]);
+        let out = render(&app, 44, 10);
+        assert!(out.contains("Thought"), "{out}");
+        assert!(out.contains("2s"), "the thought line says how long it took: {out}");
+        assert!(!out.contains("weighing options"), "collapsed by default: {out}");
+
+        // ctrl+t opens it again.
+        app.thinking_open = true;
+        let out = render(&app, 44, 10);
+        assert!(out.contains("weighing options"), "{out}");
     }
 
     #[test]

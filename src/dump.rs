@@ -192,6 +192,20 @@ fn build(state: &str, level: ColorLevel, t: u64) -> App {
                     expand_at: 0,
                 },
                 Item::Tool {
+                    name: "edit_file".into(),
+                    args: r#"{"path":"app/src/auth/TokenValidator.kt"}"#.into(),
+                    state: ToolState::Done {
+                        ok: true,
+                        ms: 34,
+                        output: "edited app/src/auth/TokenValidator.kt  +2 -1\n  10 fun validate(token: Token, now: Long): Boolean {\n  11     val expiry = token.claims.expiry\n-12     if (now <= expiry) return true\n+12     if (now < expiry) return true\n+13     // an expired token must not validate\n  14     return false\n  15 }"
+                            .into(),
+                        at: 400,
+                    },
+                    born: 300,
+                    expanded: true,
+                    expand_at: 0,
+                },
+                Item::Tool {
                     name: "bash".into(),
                     args: "printf 'a\\na\\nunique\\na' | wc -c".into(),
                     state: ToolState::Done {
@@ -200,9 +214,9 @@ fn build(state: &str, level: ColorLevel, t: u64) -> App {
                         output: "8".into(),
                         at: 500,
                     },
-                    born: 400,
-                    expanded: true,
-                    expand_at: t.saturating_sub(600),
+                    born: 450,
+                    expanded: false,
+                    expand_at: 0,
                 },
                 Item::Tool {
                     name: "web_fetch".into(),

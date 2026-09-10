@@ -103,6 +103,11 @@ pub fn body(provider: &Provider, turn: &Turn, stream: bool) -> Value {
         body["tools"] = json!(tools_json(turn.tools));
         body["tool_choice"] = json!("auto");
     }
+    // Reasoning models take an effort name; providers that do not know the
+    // level get the clamped one rather than a 400.
+    if let Some(effort) = turn.thinking.and_then(|t| t.level.effort()) {
+        body["reasoning_effort"] = json!(effort);
+    }
     body
 }
 
@@ -309,12 +314,35 @@ mod tests {
             messages: &msgs,
             tools: &[super::super::ToolSchema::new("bash", "run a command", json!({"type":"object"}))],
             max_tokens: 256,
+            thinking: super::super::Thinking::new(super::super::Level::Medium, 256),
         };
         let body = body(&provider, &t, true);
         assert!(body.get("max_completion_tokens").is_some(), "gpt-5 wants the newer field");
         assert_eq!(body["stream_options"]["include_usage"], json!(true));
         assert_eq!(body["messages"][2]["tool_call_id"], json!("c1"));
         assert_eq!(body["tools"][0]["function"]["name"], json!("bash"));
+        assert_eq!(body["reasoning_effort"], json!("medium"));
+    }
+
+    #[test]
+    fn thinking_off_sends_no_reasoning_field() {
+        let provider = Provider {
+            name: "p".into(),
+            kind: crate::config::Kind::OpenAi,
+            base_url: "https://api.groq.com/openai/v1".into(),
+            api_key: "k".into(),
+            models: Vec::new(),
+        };
+        let t = Turn {
+            model: "llama-3.3",
+            system: "s",
+            messages: &[],
+            tools: &[],
+            max_tokens: 128,
+            thinking: None,
+        };
+        let body = body(&provider, &t, true);
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]

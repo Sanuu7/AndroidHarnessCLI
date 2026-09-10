@@ -31,11 +31,11 @@ fn age(now: u64, then: u64) -> String {
 }
 
 /// Second line of a model row: the one thing worth knowing about it here.
-fn model_hint(id: &str, provider: &str) -> String {
+fn model_hint(id: &str) -> String {
     if crate::llm::models::free_slot(id) {
         "free".to_string()
     } else {
-        provider.to_string()
+        String::new()
     }
 }
 
@@ -111,10 +111,17 @@ pub struct Status {
     pub model: String,
     pub provider: String,
     pub workspace: String,
+    /// The git branch of the workspace, when it is a repository.
+    pub branch: String,
     pub session: String,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// Cache traffic for the session, and the share of the prompt it covered.
+    pub cache_read: u64,
+    pub cache_write: u64,
     pub ctx_max: u64,
+    /// How hard the model is being asked to think.
+    pub thinking: crate::llm::Level,
     /// None when the model has no price in the table.
     pub cost: Option<f64>,
     pub cost_flash: u64,
@@ -133,16 +140,31 @@ impl Default for Status {
                 .ok()
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
                 .unwrap_or_else(|| "~".into()),
+            branch: String::new(),
             session: String::new(),
             tokens_in: 0,
             tokens_out: 0,
+            cache_read: 0,
+            cache_write: 0,
             ctx_max: 128_000,
+            thinking: crate::llm::Level::Medium,
             cost: Some(0.0),
             cost_flash: 0,
             anim_in: anim::Anim::at(0.0),
             anim_out: anim::Anim::at(0.0),
             anim_cost: anim::Anim::at(0.0),
         }
+    }
+}
+
+impl Status {
+    /// Share of the prompt that came from the cache, when there was one.
+    pub fn cache_hit_pct(&self) -> Option<u32> {
+        let prompt = self.tokens_in + self.cache_read + self.cache_write;
+        if prompt == 0 || (self.cache_read == 0 && self.cache_write == 0) {
+            return None;
+        }
+        Some(((self.cache_read as f64 / prompt as f64) * 100.0).round() as u32)
     }
 }
 
@@ -216,6 +238,7 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "sessions", args: "[id]", desc: "resume a past session" },
     Command { name: "skills", args: "", desc: "list installed skills" },
     Command { name: "theme", args: "", desc: "match your terminal" },
+    Command { name: "thinking", args: "[level]", desc: "how hard the model thinks" },
 ];
 
 /// Commands that open a list instead of acting right away.
@@ -224,6 +247,7 @@ pub enum Pick {
     Model,
     Provider,
     Session,
+    Thinking,
 }
 
 impl Pick {
@@ -232,6 +256,7 @@ impl Pick {
             "model" => Some(Pick::Model),
             "provider" => Some(Pick::Provider),
             "sessions" | "resume" => Some(Pick::Session),
+            "thinking" | "think" => Some(Pick::Thinking),
             _ => None,
         }
     }
@@ -241,6 +266,7 @@ impl Pick {
             Pick::Model => "model",
             Pick::Provider => "provider",
             Pick::Session => "session",
+            Pick::Thinking => "thinking",
         }
     }
 
@@ -249,6 +275,7 @@ impl Pick {
             Pick::Model => "enter to switch, type to filter or add",
             Pick::Provider => "enter to switch",
             Pick::Session => "enter to resume",
+            Pick::Thinking => "enter to apply, ctrl+s to keep as default",
         }
     }
 }
@@ -404,6 +431,8 @@ pub struct App {
     local: Option<Receiver<AgentEvent>>,
     /// Reasoning blocks and tool cards stay open after ctrl+o.
     pub expand: bool,
+    /// Whether finished reasoning is shown in full (ctrl+t).
+    pub thinking_open: bool,
     /// Workspace preferences handed to the agent at startup.
     pub prefs: Vec<String>,
 }
@@ -434,6 +463,7 @@ impl App {
             config: None,
             local: None,
             expand: false,
+            thinking_open: false,
             prefs: Vec::new(),
         }
     }
@@ -443,6 +473,7 @@ impl App {
         self.status.model = agent.model.clone();
         self.status.provider = agent.provider.clone();
         self.status.ctx_max = agent.ctx_max;
+        self.status.thinking = config.thinking;
         self.agent = Some(agent);
         self.config = Some(config);
     }
@@ -567,6 +598,10 @@ impl App {
                     self.toggle_expand_all();
                     return;
                 }
+                KeyCode::Char('t') => {
+                    self.toggle_thinking_blocks();
+                    return;
+                }
                 KeyCode::Char('u') => {
                     self.input.clear();
                     self.popup = None;
@@ -590,6 +625,10 @@ impl App {
 
         if self.popup.is_some() {
             match key.code {
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.save_pick();
+                    return;
+                }
                 KeyCode::Up | KeyCode::BackTab => {
                     let now = self.now;
                     if let Some(p) = &mut self.popup {
@@ -621,6 +660,7 @@ impl App {
 
         match key.code {
             KeyCode::Enter => self.send(),
+            KeyCode::BackTab => self.cycle_thinking(),
             KeyCode::Tab => {
                 if self.popup.is_none() && self.input.text().starts_with('/') {
                     self.sync_popup();
@@ -775,7 +815,7 @@ impl App {
                 ids.dedup();
                 ids.into_iter()
                     .map(|id| {
-                        Choice::new(id.clone(), model_hint(&id, &provider)).current(id == current)
+                        Choice::new(id.clone(), model_hint(&id)).current(id == current)
                     })
                     .collect()
             }
@@ -804,6 +844,15 @@ impl App {
                     })
                     .collect()
             }
+            Pick::Thinking => crate::llm::Level::all()
+                .into_iter()
+                .map(|level| {
+                    let lit = crate::theme::thinking_ramp(level);
+                    let bars = format!("{}{}", "▰".repeat(lit), "▱".repeat(6 - lit));
+                    Choice::new(level.as_str(), format!("{bars}  {}", level.describe()))
+                        .current(level == self.status.thinking)
+                })
+                .collect(),
         }
     }
 
@@ -826,6 +875,31 @@ impl App {
             let _ = tx.send(AgentEvent::Models(models));
         });
         self.local = Some(rx);
+    }
+
+    /// Ctrl+S inside a picker: same as enter, plus remember it for next time.
+    fn save_pick(&mut self) {
+        let pick = self.popup.as_ref().and_then(|p| p.pick);
+        let selected = self.popup.as_ref().and_then(|p| p.selected()).map(|c| c.value);
+        let Some(pick) = pick else { return };
+        let Some(value) = selected else { return };
+        self.popup = None;
+        self.input.clear();
+        match pick {
+            Pick::Thinking => {
+                if let Some(level) = crate::llm::Level::parse(&value) {
+                    self.apply_thinking(level, true);
+                }
+            }
+            Pick::Model => {
+                self.apply_model(&value);
+                if let Some(cfg) = self.config.as_mut() {
+                    let _ = cfg.save();
+                }
+            }
+            Pick::Provider => self.apply_provider(&value),
+            Pick::Session => self.resume_session(&value),
+        }
     }
 
     fn accept_popup(&mut self) {
@@ -871,7 +945,46 @@ impl App {
                     self.resume_session(&path);
                 }
             }
+            Pick::Thinking => {
+                if let Some(name) = selected {
+                    if let Some(level) = crate::llm::Level::parse(&name) {
+                        self.apply_thinking(level, false);
+                    }
+                }
+            }
         }
+    }
+
+    /// Switch reasoning effort now, and remember it if asked.
+    pub fn apply_thinking(&mut self, level: crate::llm::Level, save: bool) {
+        self.status.thinking = level;
+        if let Some(agent) = &self.agent {
+            agent.set_thinking(level);
+        }
+        if save {
+            if let Some(cfg) = self.config.as_mut() {
+                cfg.thinking = level;
+                let _ = cfg.save();
+            }
+        }
+        let note = if level.is_off() {
+            "thinking off".to_string()
+        } else {
+            format!("thinking {}", level.as_str())
+        };
+        self.note(&note, false);
+    }
+
+    /// One key to walk the levels, the way pi binds shift+tab.
+    fn cycle_thinking(&mut self) {
+        let next = self.status.thinking.next();
+        self.apply_thinking(next, false);
+    }
+
+    fn toggle_thinking_blocks(&mut self) {
+        self.thinking_open = !self.thinking_open;
+        let note = if self.thinking_open { "thinking shown" } else { "thinking hidden" };
+        self.note(note, false);
     }
 
     fn send(&mut self) {
@@ -977,6 +1090,23 @@ impl App {
                     self.open_picker(Pick::Model);
                 } else {
                     self.apply_model(&rest);
+                }
+            }
+            "thinking" | "think" => {
+                match crate::llm::Level::parse(&rest) {
+                    Some(level) => self.apply_thinking(level, true),
+                    None if rest.is_empty() => self.open_picker(Pick::Thinking),
+                    None => self.note(
+                        &format!(
+                            "unknown level '{rest}'. try: {}",
+                            crate::llm::Level::all()
+                                .iter()
+                                .map(|l| l.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        ),
+                        true,
+                    ),
                 }
             }
             "provider" => {
@@ -1250,7 +1380,9 @@ impl App {
                     }
                 }
             }
-            AgentEvent::Usage { tokens_in, tokens_out, cost } => {
+            AgentEvent::Usage { tokens_in, tokens_out, cost, cache_read, cache_write } => {
+                self.status.cache_read = cache_read;
+                self.status.cache_write = cache_write;
                 self.status.set_usage(tokens_in, tokens_out, cost, self.now);
             }
             AgentEvent::Models(models) => self.fill_models(models),
@@ -1282,12 +1414,10 @@ impl App {
             return;
         }
         let current = self.status.model.clone();
-        let provider = self.status.provider.clone();
-        let mut choices = vec![Choice::new(current.clone(), model_hint(&current, &provider))
-            .current(true)];
+        let mut choices = vec![Choice::new(current.clone(), model_hint(&current)).current(true)];
         for id in models {
             if id != current {
-                let hint = model_hint(&id, &provider);
+                let hint = model_hint(&id);
                 choices.push(Choice::new(id, hint));
             }
         }

@@ -4,6 +4,7 @@ mod agent;
 mod anim;
 mod app;
 mod config;
+mod diff;
 mod dump;
 mod input;
 mod llm;
@@ -52,6 +53,10 @@ fn main() -> io::Result<()> {
                 i += 1;
                 options.model = args.get(i).cloned();
             }
+            "--thinking" | "-t" => {
+                i += 1;
+                options.thinking = args.get(i).cloned();
+            }
             "--provider" | "-p" => {
                 i += 1;
                 options.provider = args.get(i).cloned();
@@ -88,6 +93,8 @@ struct Options {
     dir: Option<String>,
     /// One-shot, headless: prompt in, answer on stdout.
     print: Option<String>,
+    /// Thinking level for this run, overriding the config.
+    thinking: Option<String>,
     /// Some(None) resumes the newest session, Some(Some(id)) a specific one.
     resume: Option<Option<String>>,
 }
@@ -101,6 +108,7 @@ An agent for the terminal, built for a phone. No key needed to start.
 usage: harness [options]
 
   -m, --model <name>       use this model
+  -t, --thinking <level>   off, minimal, low, medium, high, xhigh, max
   -p, --provider <name>    use this provider from the config
   -C, --dir <path>         work in this directory
   -c, --continue [id]      resume the newest session, or one by id
@@ -113,17 +121,19 @@ usage: harness [options]
 keys:
   enter      send            ctrl+j     new line
   tab        complete        type /     commands and pickers
-  up/down    history         pgup/pgdn  scroll back
-  ctrl+e     expand tool     ctrl+o     expand everything
+  up/down    history         shift+tab  cycle thinking level
+  ctrl+t     show thinking   ctrl+o     expand tool output
+  ctrl+e     expand tool     ctrl+s     save in a picker
+  pgup/pgdn  scroll back     ctrl+w     delete word
   ctrl+c     cancel, twice to quit      ctrl+d  quit now
-  ctrl+w     delete word     ctrl+l     redraw
 
-commands: /model /provider /sessions /new /clear /compact /cost /doctor
-          /init /skills /theme /help /quit
+commands: /model /provider /thinking /sessions /new /clear /compact /cost
+          /doctor /init /skills /theme /help /quit
 
 env:
   HARNESS_API_KEY=...         key for the active provider
   HARNESS_MODEL=...           override the model
+  HARNESS_THINKING=...        off, minimal, low, medium, high, xhigh, max
   HARNESS_COLOR=true|256|16   force a color depth
   HARNESS_BG=rrggbb           terminal background guess, for fade-ins
 
@@ -193,8 +203,9 @@ fn build_agent(app: &mut App, options: &Options) -> Option<(Agent, config::Confi
     if !root.join(".harness").exists() {
         let _ = std::fs::create_dir_all(root.join(".harness/memory"));
     }
+    app.status.branch = agent::git_branch(&root).unwrap_or_default();
     let ctx_max = agent::default_ctx_max(&cfg.model);
-    let agent = Agent::start(provider, cfg.model.clone(), root, ctx_max, app.prefs.clone());
+    let agent = Agent::start(provider, cfg.model.clone(), root, ctx_max, cfg.thinking, app.prefs.clone());
 
     match resume(&cfg, options) {
         Some((session, from_args)) => {
@@ -266,7 +277,11 @@ fn run_print(prompt: &str, options: Options) -> io::Result<()> {
     }
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let ctx_max = agent::default_ctx_max(&model);
-    let agent = Agent::start(provider, model, root, ctx_max, Vec::new());
+    let level = match options.thinking.as_deref().and_then(llm::Level::parse) {
+        Some(level) => level,
+        None => cfg.thinking,
+    };
+    let agent = Agent::start(provider, model, root, ctx_max, level, Vec::new());
     agent.say(prompt);
 
     let mut streamed = false;
@@ -298,7 +313,7 @@ fn run_print(prompt: &str, options: Options) -> io::Result<()> {
                     eprintln!("harness: {text}");
                     std::process::exit(1);
                 }
-                agent::AgentEvent::Usage { tokens_in, tokens_out, cost } => {
+                agent::AgentEvent::Usage { tokens_in, tokens_out, cost, .. } => {
                     let cost = match cost {
                         Some(c) if c == 0.0 => "free".to_string(),
                         Some(c) => format!("${c:.4}"),

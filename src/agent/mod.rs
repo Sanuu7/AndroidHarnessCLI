@@ -9,7 +9,7 @@ pub mod cost;
 pub mod prompt;
 
 use crate::config::Provider;
-use crate::llm::{self, Delta, Msg, Role, ToolCall, Usage, Wire, http};
+use crate::llm::{self, Delta, Level, Msg, Role, ToolCall, Usage, Wire, http};
 use crate::session::Session;
 use crate::tools;
 use std::path::PathBuf;
@@ -20,6 +20,10 @@ use std::time::{Duration, Instant};
 /// Tool rounds before the agent stops on its own. Long enough for real work,
 /// short enough that a loop cannot run all night.
 pub const MAX_STEPS: usize = 24;
+/// Room for the answer itself, on top of whatever thinking takes.
+const ANSWER_TOKENS: u32 = 8_192;
+/// Ceiling for one response, thinking included. A phone does not need more.
+const MAX_OUTPUT_TOKENS: u32 = 65_536;
 /// Attempts per model call before the error is shown.
 const MAX_ATTEMPTS: usize = 3;
 /// Base gap between attempts; grows with each try.
@@ -36,7 +40,7 @@ pub enum AgentEvent {
     Token(String),
     ToolStart { name: String, args: String },
     ToolDone { name: String, output: String, ok: bool, ms: u64 },
-    Usage { tokens_in: u64, tokens_out: u64, cost: Option<f64> },
+    Usage { tokens_in: u64, tokens_out: u64, cost: Option<f64>, cache_read: u64, cache_write: u64 },
     /// A live model list for the picker, fetched in the background.
     Models(Vec<String>),
     /// Something worth a line of its own: retries, compaction, limits.
@@ -53,6 +57,7 @@ enum Cmd {
     New,
     Compact,
     Swap { provider: Box<Provider>, model: String },
+    SetThinking(Level),
     Load(Box<Session>),
     Shutdown,
 }
@@ -69,7 +74,14 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn start(provider: Provider, model: String, root: PathBuf, ctx_max: u64, prefs: Vec<String>) -> Agent {
+    pub fn start(
+        provider: Provider,
+        model: String,
+        root: PathBuf,
+        ctx_max: u64,
+        level: Level,
+        prefs: Vec<String>,
+    ) -> Agent {
         let (tx, rx) = channel::<Cmd>();
         let (etx, erx) = channel::<AgentEvent>();
         let cancel = http::Cancel::new();
@@ -84,12 +96,16 @@ impl Agent {
                 model,
                 root,
                 messages: Vec::new(),
-                session: Session::new(&model_in, &provider_in),                tx: etx,
+                session: Session::new(&model_in, &provider_in),
+                tx: etx,
                 cancel: worker_cancel,
                 session_in: 0,
                 session_out: 0,
+                cache_read: 0,
+                cache_write: 0,
                 cost: None,
                 ctx_max,
+                level,
                 prefs,
             };
             worker.run(rx);
@@ -134,6 +150,11 @@ impl Agent {
         let _ = self.tx.send(Cmd::Swap { provider: Box::new(provider), model });
     }
 
+    /// How hard the model should think on the next request.
+    pub fn set_thinking(&self, level: Level) {
+        let _ = self.tx.send(Cmd::SetThinking(level));
+    }
+
     pub fn poll(&self) -> Vec<AgentEvent> {
         let mut out = Vec::new();
         loop {
@@ -167,8 +188,13 @@ struct Worker {
     /// Prompt tokens of the last request: how full the context is.
     session_in: u64,
     session_out: u64,
+    /// Cache traffic for the session, so the footer can show a hit rate.
+    cache_read: u64,
+    cache_write: u64,
     cost: Option<f64>,
     ctx_max: u64,
+    /// How hard to think, sent on every request.
+    level: Level,
     prefs: Vec<String>,
 }
 
@@ -206,6 +232,10 @@ impl Worker {
                     self.model = model;
                     self.session.model = self.model.clone();
                     self.session.provider = self.provider.name.clone();
+                    emit(&self.tx, AgentEvent::Done);
+                }
+                Cmd::SetThinking(level) => {
+                    self.level = level;
                     emit(&self.tx, AgentEvent::Done);
                 }
                 Cmd::Load(session) => {
@@ -247,6 +277,14 @@ impl Worker {
 
             self.account(&result.usage);
             let has_text = !result.text.trim().is_empty();
+            // A reply that stopped at the ceiling is worth saying out loud:
+            // otherwise a half-finished answer looks finished.
+            if result.finish.as_deref() == Some("length") {
+                emit(
+                    &self.tx,
+                    AgentEvent::Notice("response hit the token limit and was cut off".into()),
+                );
+            }
             self.messages.push(Msg::assistant(result.text, result.calls.clone()));
             if result.calls.is_empty() {
                 break;
@@ -433,12 +471,17 @@ impl Worker {
     fn stream_turn(&mut self) -> Result<TurnResult, StreamError> {
         let system = prompt::build(&self.root, &self.prefs);
         let schemas = tools::schemas();
+        // Thinking is paid for out of the same budget as the answer, so the
+        // ceiling grows with it instead of squeezing the reply.
+        let thinking = llm::Thinking::new(self.level, ANSWER_TOKENS + self.level.budget());
+        let max_tokens = if thinking.is_some() { ANSWER_TOKENS + self.level.budget() } else { ANSWER_TOKENS };
         let turn = llm::Turn {
             model: &self.model,
             system: &system,
             messages: &self.messages,
             tools: &schemas,
-            max_tokens: 8_192,
+            max_tokens: max_tokens.min(MAX_OUTPUT_TOKENS),
+            thinking,
         };
         let (kind, provider) = llm::relay::route(&self.provider, &self.model);
         let mut wire: Box<dyn Wire> = llm::wire_for(kind);
@@ -536,6 +579,9 @@ impl Worker {
         if let Some(usage) = delta.usage.take() {
             result.usage = usage;
         }
+        if let Some(finish) = delta.finish.take() {
+            result.finish = Some(finish);
+        }
     }
 
     fn account(&mut self, usage: &Usage) {
@@ -543,6 +589,8 @@ impl Worker {
             self.session_in = usage.input;
         }
         self.session_out += usage.output;
+        self.cache_read += usage.cache_read;
+        self.cache_write += usage.cache_write;
         match cost::estimate(&self.model, usage) {
             Some(extra) => self.cost = Some(self.cost.unwrap_or(0.0) + extra),
             // An unpriced model reports no cost rather than a fake one.
@@ -554,6 +602,8 @@ impl Worker {
                 tokens_in: self.session_in,
                 tokens_out: self.session_out,
                 cost: self.cost,
+                cache_read: self.cache_read,
+                cache_write: self.cache_write,
             },
         );
     }
@@ -624,6 +674,8 @@ impl Worker {
             messages: &messages,
             tools: &schemas,
             max_tokens: 2_048,
+            // Summarizing is not the place to think; it costs budget and time.
+            thinking: None,
         };
         // A summary is a normal turn with the tools switched off, and its
         // tokens are ignored: the status bar should show the live session.
@@ -668,6 +720,8 @@ struct TurnResult {
     text: String,
     calls: Vec<ToolCall>,
     usage: Usage,
+    /// Why the model stopped, when it said: "length" means it was cut off.
+    finish: Option<String>,
 }
 
 struct StreamError {
@@ -695,6 +749,25 @@ fn sleep_cancellable(ms: u64, cancel: &http::Cancel) -> bool {
     !cancel.cancelled()
 }
 
+/// The git branch of the workspace, if it is a repository. One call at
+/// startup, so the header can say where the work is happening.
+pub fn git_branch(root: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(root)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        return None;
+    }
+    Some(branch)
+}
+
 /// SSE payload of a line, or None for comments, events, and blanks.
 pub fn sse_payload(line: &str) -> Option<String> {
     let line = line.trim_end_matches('\r');
@@ -703,8 +776,7 @@ pub fn sse_payload(line: &str) -> Option<String> {
 }
 
 /// A context window that fits the model, when nothing better is known.
-pub fn default_ctx_max(model: &str) -> u64 {
-    let m = model.to_ascii_lowercase();
+pub fn default_ctx_max(model: &str) -> u64 {    let m = model.to_ascii_lowercase();
     if m.contains("gemini") {
         1_000_000
     } else if m.contains("claude") || m.contains("gpt-5") || m.contains("gpt-4.1") {
@@ -752,7 +824,14 @@ mod tests {
             api_key: String::new(),
             models: Vec::new(),
         };
-        let agent = Agent::start(provider, "test-model".into(), dir, 128_000, Vec::new());
+        let agent = Agent::start(
+            provider,
+            "test-model".into(),
+            dir,
+            128_000,
+            Level::Medium,
+            Vec::new(),
+        );
         assert_eq!(agent.model, "test-model");
         assert!(agent.poll().is_empty());
         drop(agent);

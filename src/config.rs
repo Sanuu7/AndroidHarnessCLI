@@ -89,6 +89,8 @@ pub struct Config {
     pub providers: Vec<Provider>,
     pub provider: String,
     pub model: String,
+    /// How hard the model should think by default.
+    pub thinking: crate::llm::Level,
     /// Written for the user to read; the CLI keeps its own sane defaults.
     pub raw: Value,
     pub path: PathBuf,
@@ -149,6 +151,11 @@ impl Config {
                 .and_then(|m| m.as_str())
                 .unwrap_or(HARNESS_MODEL)
                 .to_string(),
+            thinking: raw
+                .get("thinking")
+                .and_then(|t| t.as_str())
+                .and_then(crate::llm::Level::parse)
+                .unwrap_or(crate::llm::Level::Medium),
             providers,
             raw,
             path,
@@ -170,6 +177,11 @@ impl Config {
         if let Ok(model) = std::env::var("HARNESS_MODEL") {
             if !model.is_empty() {
                 self.model = model;
+            }
+        }
+        if let Ok(level) = std::env::var("HARNESS_THINKING") {
+            if let Some(level) = crate::llm::Level::parse(&level) {
+                self.thinking = level;
             }
         }
         if let Ok(provider) = std::env::var("HARNESS_PROVIDER") {
@@ -212,6 +224,7 @@ impl Config {
         self.raw = json!({
             "provider": self.provider,
             "model": self.model,
+            "thinking": self.thinking.as_str(),
             "providers": self.providers.iter().map(|p| p.to_json()).collect::<Vec<_>>(),
         });
         let text = serde_json::to_string_pretty(&self.raw).unwrap_or_else(|_| "{}".into());
