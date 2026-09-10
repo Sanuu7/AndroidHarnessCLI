@@ -1,4 +1,4 @@
-# Harness CLI
+# Android Harness CLI
 
 An agent for the terminal, built for the phone in your pocket.
 
@@ -55,9 +55,30 @@ a matter of replacing one module.
 - Color depth handling: truecolor where available, 256-color and 16-color
   fallbacks detected from `COLORTERM` and `TERM`.
 
-## Install on Termux
+## Install
 
-### Option A: build on the phone
+One line, in Termux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Sanuu7/AndroidHarnessCLI/main/install.sh | bash
+```
+
+It picks the right static binary for your CPU, drops it in `$PREFIX/bin`, and
+tells you if that is not on your `PATH` yet. Nothing else to install: the
+binary carries its own libc and does not link OpenSSL.
+
+```
+>> downloading harness (aarch64, main)
+>> installed /data/data/com.termux/files/usr/bin/harness (713K)
+>> run it with: harness
+```
+
+Pin a specific version instead of `main` with
+`curl -fsSL .../install.sh | bash -s -- --ref v0.1.0`.
+
+### Build it yourself
+
+#### Option A: on the phone
 
 ```bash
 pkg install rust
@@ -70,7 +91,7 @@ The first build takes a few minutes on a phone. After that, incremental
 builds are quick. The script prints the binary path and how to put it on
 `PATH`.
 
-### Option B: cross-compile on a desktop (faster)
+#### Option B: cross-compile on a desktop (faster)
 
 A static `aarch64-unknown-linux-musl` binary needs no Termux packages at all,
 since it carries its own libc and links no OpenSSL.
@@ -149,6 +170,9 @@ python3 tools/ansi2html.py < frame.ansi > frame.html
 ## How it is put together
 
 ```
+install.sh       what the one-line install downloads and runs
+scripts/         build-termux.sh, build-cross.sh, release.sh (refreshes dist/)
+dist/            committed static binaries, aarch64 and x86_64
 src/
   main.rs        terminal setup, event loop, frame pacing
   app.rs         state, key handling, agent events, layout decisions
