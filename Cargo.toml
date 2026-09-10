@@ -1,0 +1,21 @@
+[package]
+name = "harness-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Harness for the terminal. Agent UI built for phones running Termux."
+license = "MIT"
+
+[[bin]]
+name = "harness"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.30.2"
+unicode-width = "0.2.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
