@@ -69,7 +69,7 @@ binary carries its own libc and does not link OpenSSL.
 
 ```
 >> downloading harness (aarch64, main)
->> installed /data/data/com.termux/files/usr/bin/harness (713K)
+>> installed /data/data/com.termux/files/usr/bin/harness (697K)
 >> run it with: harness
 ```
 
