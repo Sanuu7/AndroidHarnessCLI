@@ -1,0 +1,5 @@
+# Static musl builds for aarch64 need the toolchain's own linker. The system
+# cc passes the target's flags to a host linker that does not know them
+# ("/usr/bin/ld: unrecognized option '--fix-cortex-a53-843419'").
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
