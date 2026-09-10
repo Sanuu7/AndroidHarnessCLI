@@ -1,3 +1,5 @@
 /target
 /frames
 *.log
+.tmpws
+.tmphome

@@ -158,6 +158,7 @@ fn item_lines(item: &Item, app: &App, w: usize, scale: f32) -> Vec<Line<'static>
             ..
         } => assistant_lines(text, *streaming, *finished, app, w, alpha),
         Item::Thinking { born } => thinking_lines(app, *born, w, alpha),
+        Item::Reasoning { text, .. } => reasoning_lines(app, text, w, alpha),
         Item::Tool {
             name,
             args,
@@ -172,6 +173,45 @@ fn item_lines(item: &Item, app: &App, w: usize, scale: f32) -> Vec<Line<'static>
             born,
         } => note_lines(app, text, *error, *born, alpha, w),
     }
+}
+
+/// Reasoning streams are context, not the answer: quiet, clamped to a few
+/// lines, and they never shout over the reply that follows them.
+fn reasoning_lines(app: &App, text: &str, w: usize, alpha: f32) -> Vec<Line<'static>> {
+    let t = &app.theme;
+    let budget = w.saturating_sub(BODY_INDENT + 2).max(8);
+    let flat = text.replace('\n', " ");
+    let rows = wrap(&flat, budget);
+    let shown = rows.len().min(3);
+    let start = rows.len().saturating_sub(shown);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    // A breathing dot marks the stream while it is still arriving.
+    let pulse = anim::breathe(app.now, 1100);
+    let color = theme::lerp(t.faint, t.accent2, pulse * 0.35);
+    for (i, row) in rows[start..].iter().enumerate() {
+        let mut spans = vec![Span::raw(" ".repeat(BODY_INDENT))];
+        spans.push(Span::styled(
+            if i == 0 { "│ " } else { "  " }.to_string(),
+            Style::default().fg(t.fade(color, alpha * 0.8)),
+        ));
+        spans.push(Span::styled(
+            row.clone(),
+            Style::default()
+                .fg(t.fade(t.faint, alpha * 0.9))
+                .add_modifier(Modifier::ITALIC),
+        ));
+        out.push(Line::from(spans));
+    }
+    if rows.len() > shown {
+        out.insert(
+            0,
+            Line::from(Span::styled(
+                format!("{}… {} earlier lines", " ".repeat(BODY_INDENT), rows.len() - shown),
+                Style::default().fg(t.fade(t.faint, alpha * 0.6)),
+            )),
+        );
+    }
+    out
 }
 
 fn user_lines(text: &str, t: &Theme, w: usize, alpha: f32) -> Vec<Line<'static>> {
@@ -466,8 +506,16 @@ fn tool_lines(
     // Collapsed cards keep one line of result visible: the useful part.
     match (expanded, output) {
         (false, Some(text)) if has_body => {
-            let mut shown = text.trim().lines().next().unwrap_or("").trim().to_string();
-            let more = text.trim().lines().count() > 1;
+            // The first line that says something: tool output often starts
+            // with a heading or a blank.
+            let mut shown = text
+                .trim()
+                .lines()
+                .map(|l| l.trim())
+                .find(|l| !l.is_empty())
+                .unwrap_or("")
+                .to_string();
+            let more = text.trim().lines().filter(|l| !l.trim().is_empty()).count() > 1;
             let budget = w.saturating_sub(CARD_INDENT + 2);
             shown = truncate(&shown, budget);
             if more && width(&shown) < budget {

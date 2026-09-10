@@ -4,14 +4,15 @@
 //! from the monotonic clock. Frame dumps set it by hand so animations can be
 //! inspected mid-flight.
 
+use crate::agent::{Agent, AgentEvent};
 use crate::anim::{self, Tween};
-use crate::demo::{AgentEvent, Demo};
 use crate::input::Input;
 use crate::theme::Theme;
 use crate::ui;
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::cell::Cell;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 pub const SPLASH_MS: u64 = 1500;
 
@@ -45,7 +46,13 @@ pub enum Item {
         streaming: bool,
         finished: u64,
     },
+    /// The model is working before its first visible token.
     Thinking {
+        born: u64,
+    },
+    /// A reasoning stream: shown quiet and clamped, it is not the answer.
+    Reasoning {
+        text: String,
         born: u64,
     },
     Tool {
@@ -69,6 +76,7 @@ impl Item {
             Item::User { born, .. }
             | Item::Assistant { born, .. }
             | Item::Thinking { born }
+            | Item::Reasoning { born, .. }
             | Item::Tool { born, .. }
             | Item::Note { born, .. } => *born,
         }
@@ -77,11 +85,14 @@ impl Item {
 
 pub struct Status {
     pub model: String,
+    pub provider: String,
     pub workspace: String,
+    pub session: String,
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub ctx_max: u64,
-    pub cost: f64,
+    /// None when the model has no price in the table.
+    pub cost: Option<f64>,
     pub cost_flash: u64,
     // Displayed values walk toward the real ones so counters never jump.
     anim_in: anim::Anim,
@@ -92,15 +103,17 @@ pub struct Status {
 impl Default for Status {
     fn default() -> Self {
         Self {
-            model: "glm-5.3-flash".into(),
+            model: String::new(),
+            provider: String::new(),
             workspace: std::env::current_dir()
                 .ok()
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
                 .unwrap_or_else(|| "~".into()),
+            session: String::new(),
             tokens_in: 0,
             tokens_out: 0,
             ctx_max: 128_000,
-            cost: 0.0,
+            cost: Some(0.0),
             cost_flash: 0,
             anim_in: anim::Anim::at(0.0),
             anim_out: anim::Anim::at(0.0),
@@ -111,15 +124,22 @@ impl Default for Status {
 
 impl Status {
     /// New usage numbers: targets update immediately, the readout catches up.
-    pub fn set_usage(&mut self, tokens_in: u64, tokens_out: u64, cost: f64, now: u64) {
+    pub fn set_usage(
+        &mut self,
+        tokens_in: u64,
+        tokens_out: u64,
+        cost: Option<f64>,
+        now: u64,
+    ) {
         if tokens_in != self.tokens_in {
             self.anim_in.set(tokens_in as f32, now, 520);
         }
         if tokens_out != self.tokens_out {
             self.anim_out.set(tokens_out as f32, now, 520);
         }
-        if (cost - self.cost).abs() > f64::EPSILON {
-            self.anim_cost.set(cost as f32, now, 520);
+        let price = cost.map(|c| c as f32).unwrap_or(self.anim_cost.get(now));
+        if cost.is_some() && (cost.unwrap() - self.cost.unwrap_or(-1.0)).abs() > f64::EPSILON {
+            self.anim_cost.set(price, now, 520);
             self.cost_flash = now;
         }
         self.tokens_in = tokens_in;
@@ -159,16 +179,19 @@ pub struct Command {
 }
 
 pub const COMMANDS: &[Command] = &[
-    Command { name: "clear", args: "", desc: "reset the conversation" },
+    Command { name: "clear", args: "", desc: "forget this conversation" },
     Command { name: "compact", args: "", desc: "summarize older messages" },
     Command { name: "cost", args: "", desc: "spend for this session" },
-    Command { name: "doctor", args: "", desc: "self-test every tool" },
+    Command { name: "doctor", args: "", desc: "self-test the tools" },
     Command { name: "help", args: "", desc: "keys and commands" },
     Command { name: "init", args: "", desc: "write AGENTS.md for this repo" },
-    Command { name: "model", args: "<name>", desc: "switch the model" },
-    Command { name: "plan", args: "", desc: "propose before acting" },
+    Command { name: "model", args: "[name]", desc: "switch the model" },
+    Command { name: "new", args: "", desc: "start a fresh session" },
+    Command { name: "provider", args: "[name]", desc: "switch or list providers" },
+    Command { name: "quit", args: "", desc: "leave" },
+    Command { name: "sessions", args: "", desc: "past sessions" },
     Command { name: "skills", args: "", desc: "list installed skills" },
-    Command { name: "theme", args: "dark|light", desc: "match your terminal" },
+    Command { name: "theme", args: "", desc: "match your terminal" },
 ];
 
 pub struct Popup {
@@ -225,7 +248,6 @@ pub struct App {
     pub help: bool,
     pub help_at: u64,
     pub status: Status,
-    pub demo: Demo,
     pub quit: bool,
     pub clear_screen: bool,
     pub ctrl_c_at: u64,
@@ -234,6 +256,14 @@ pub struct App {
     pub sent_at: u64,
     /// When a run was cancelled, which flashes the divider red.
     pub cancel_at: u64,
+    /// The engine. Frame dumps run without one.
+    agent: Option<Agent>,
+    /// The settings file, for switching models and providers at runtime.
+    pub config: Option<crate::config::Config>,
+    /// Events from tool runs the UI started itself, such as /doctor.
+    local: Option<Receiver<AgentEvent>>,
+    /// Workspace preferences handed to the agent at startup.
+    pub prefs: Vec<String>,
 }
 
 impl App {
@@ -252,14 +282,26 @@ impl App {
             help: false,
             help_at: 0,
             status: Status::default(),
-            demo: Demo::start(),
             quit: false,
             clear_screen: false,
             ctrl_c_at: 0,
             view_h: Cell::new(20),
             sent_at: 0,
             cancel_at: 0,
+            agent: None,
+            config: None,
+            local: None,
+            prefs: Vec::new(),
         }
+    }
+
+    /// Hand the app a live engine and the settings it came from.
+    pub fn attach(&mut self, agent: Agent, config: crate::config::Config) {
+        self.status.model = agent.model.clone();
+        self.status.provider = agent.provider.clone();
+        self.status.ctx_max = agent.ctx_max;
+        self.agent = Some(agent);
+        self.config = Some(config);
     }
 
     /// Nothing on screen yet, so the views show the welcome.
@@ -269,8 +311,24 @@ impl App {
 
     pub fn update(&mut self, now: u64) {
         self.now = now;
-        for ev in self.demo.poll() {
-            self.on_agent(ev);
+        if let Some(agent) = &self.agent {
+            for ev in agent.poll() {
+                self.on_agent(ev);
+            }
+        }
+        // Local jobs (a UI-run tool) push through the same handler. The
+        // receiver is taken out so the handler can borrow self mutably.
+        if let Some(rx) = self.local.take() {
+            loop {
+                match rx.try_recv() {
+                    Ok(ev) => self.on_agent(ev),
+                    Err(TryRecvError::Empty) => {
+                        self.local = Some(rx);
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            }
         }
         if self.phase == Phase::Splash && now.saturating_sub(self.boot_at) >= SPLASH_MS {
             self.phase = Phase::Chat;
@@ -308,6 +366,7 @@ impl App {
             Item::Assistant { finished, .. } => {
                 *finished > 0 && self.now.saturating_sub(*finished) < 700
             }
+            Item::Reasoning { born, .. } => self.now.saturating_sub(*born) < 200,
             _ => false,
         }) {
             return true;
@@ -359,6 +418,10 @@ impl App {
                 }
                 KeyCode::Char('e') => {
                     self.toggle_last_tool();
+                    return;
+                }
+                KeyCode::Char('o') => {
+                    self.toggle_expand_all();
                     return;
                 }
                 KeyCode::Char('u') => {
@@ -446,20 +509,28 @@ impl App {
     }
 
     fn skip_splash(&mut self) {
-        self.phase = Phase::Chat;
-        self.chat_at = self.now;
+        if self.phase == Phase::Splash {
+            self.phase = Phase::Chat;
+            self.chat_at = self.now;
+        }
     }
 
     fn ctrl_c(&mut self) {
         if self.busy {
-            self.demo.cancel();
+            self.cancel_run();
             return;
         }
         if self.now.saturating_sub(self.ctrl_c_at) < 2000 {
             self.quit = true;
         } else {
             self.ctrl_c_at = self.now;
-            self.note("press ctrl+c again to quit", false);
+            self.note("press ctrl+c again to quit · ctrl+d leaves now", false);
+        }
+    }
+
+    pub fn cancel_run(&mut self) {
+        if let Some(agent) = &self.agent {
+            agent.cancel();
         }
     }
 
@@ -477,6 +548,18 @@ impl App {
         {
             *expanded = !*expanded;
             *expand_at = self.now;
+        }
+    }
+
+    /// Open every card in the transcript, or close them all.
+    fn toggle_expand_all(&mut self) {
+        let any_open = self.items.iter().any(|i| matches!(i, Item::Tool { expanded: true, .. }));
+        let now = self.now;
+        for item in self.items.iter_mut() {
+            if let Item::Tool { expanded, expand_at, .. } = item {
+                *expanded = !any_open;
+                *expand_at = now;
+            }
         }
     }
 
@@ -530,21 +613,39 @@ impl App {
             self.run_command(cmd.trim());
             return;
         }
+        let Some(agent) = &self.agent else {
+            self.note("no engine attached in this mode", true);
+            return;
+        };
         self.sent_at = self.now;
         self.items.push(Item::User {
             text: text.clone(),
             born: self.now,
         });
         self.busy = true;
-        self.demo.send(&text);
+        agent.say(&text);
     }
 
+    // -- commands ---------------------------------------------------------
+
     fn run_command(&mut self, cmd: &str) {
-        let name = cmd.split_whitespace().next().unwrap_or("");
+        let mut parts = cmd.splitn(2, char::is_whitespace);
+        let name = parts.next().unwrap_or("");
+        let rest = parts.next().unwrap_or("").trim().to_string();
         match name {
             "clear" => {
                 self.items.clear();
+                if let Some(agent) = &self.agent {
+                    agent.new_session();
+                }
                 self.note("conversation cleared", false);
+            }
+            "new" => {
+                self.items.clear();
+                if let Some(agent) = &self.agent {
+                    agent.new_session();
+                }
+                self.note("new session", false);
             }
             "help" => {
                 self.help = true;
@@ -552,36 +653,191 @@ impl App {
             }
             "cost" => {
                 let s = &self.status;
+                let cost = match s.cost {
+                    Some(c) if c == 0.0 => "free".to_string(),
+                    Some(c) => format!("${c:.4}"),
+                    None => "unpriced".to_string(),
+                };
+                let line = format!(
+                    "session: {cost} · {} in / {} out · context {}% of {}K",
+                    crate::textutil::short_num(s.tokens_in),
+                    crate::textutil::short_num(s.tokens_out),
+                    s.ctx_pct(self.now),
+                    s.ctx_max / 1000
+                );
+                self.note(&line, false);
+            }
+            "compact" => {
+                if let Some(agent) = &self.agent {
+                    agent.compact();
+                    self.busy = true;
+                    self.note("summarizing the older half of the conversation", false);
+                }
+            }
+            "doctor" => self.spawn_tool("doctor", "{\"network\":\"skip\"}"),
+            "skills" => self.spawn_tool("skills_list", "{}"),
+            "init" => self.write_agents_md(),
+            "sessions" => self.list_sessions(),
+            "theme" => {
+                let level = match self.theme.level {
+                    crate::theme::ColorLevel::True => "truecolor",
+                    crate::theme::ColorLevel::Indexed => "256 colors",
+                    crate::theme::ColorLevel::Basic => "16 colors",
+                };
                 self.note(
                     &format!(
-                        "this session: ${:.4} · {} in / {} out · {}K context",
-                        s.cost,
-                        crate::textutil::short_num(s.tokens_in),
-                        crate::textutil::short_num(s.tokens_out),
-                        s.ctx_max / 1000
+                        "detected {level}. force another with HARNESS_COLOR=true|256|16, and set \
+                         HARNESS_BG=rrggbb if your terminal is light"
                     ),
                     false,
                 );
             }
-            "compact" => {
-                self.note("older messages summarized, context at 18%", false);
-            }
-            "doctor" => {
-                self.note("running doctor", false);
-                self.busy = true;
-                self.demo.send("__doctor");
-            }
-            "skills" => {
-                self.note("3 skills installed: commit-style, rust-review, termux-notes", false);
-            }
-            "init" | "plan" | "model" | "theme" => {
-                self.note(&format!("/{name} lands with the engine, UI only for now"), false);
-            }
+            "model" => self.switch_model(&rest),
+            "provider" => self.switch_provider(&rest),
+            "quit" | "q" => self.quit = true,
             "" => {}
-            other => {
-                self.note(&format!("unknown command: /{other}"), true);
-            }
+            other => self.note(&format!("unknown command: /{other}"), true),
         }
+    }
+
+    fn switch_model(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            let model = self.status.model.clone();
+            let provider = self.status.provider.clone();
+            self.note(
+                &format!("model: {model} · provider {provider} · switch with /model <name>"),
+                false,
+            );
+            return;
+        }
+        let current = self.status.provider.clone();
+        let Some(cfg) = self.config.as_mut() else {
+            self.note("no config loaded", true);
+            return;
+        };
+        let Some(provider) = cfg.find(&current).cloned() else {
+            self.note("could not find the active provider in the config", true);
+            return;
+        };
+        let mut updated = provider;
+        if !updated.models.iter().any(|m| m == name) {
+            updated.models.push(name.to_string());
+        }
+        let _ = cfg.set_active(&updated.name, name);
+        if let Some(agent) = &mut self.agent {
+            agent.swap(updated, name.to_string());
+        }
+        self.status.model = name.to_string();
+        self.note(&format!("model set to {name}"), false);
+    }
+
+    fn switch_provider(&mut self, name: &str) {
+        let name = name.trim();
+        let models = self
+            .config
+            .as_ref()
+            .map(|c| {
+                c.providers
+                    .iter()
+                    .map(|p| format!("{} ({})", p.name, p.kind.as_str()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if name.is_empty() {
+            let current = self.status.provider.clone();
+            self.note(&format!("providers: {} · on {current}", models.join(", ")), false);
+            return;
+        }
+        let Some(cfg) = self.config.as_mut() else {
+            self.note("no config loaded", true);
+            return;
+        };
+        let Some(provider) = cfg.find(name).cloned() else {
+            self.note(&format!("unknown provider '{name}'. known: {}", models.join(", ")), true);
+            return;
+        };
+        let model = provider
+            .models
+            .first()
+            .cloned()
+            .unwrap_or_else(|| cfg.model.clone());
+        let _ = cfg.set_active(&provider.name, &model);
+        let provider_name = provider.name.clone();
+        if let Some(agent) = &mut self.agent {
+            agent.swap(provider, model.clone());
+        }
+        self.status.provider = provider_name.clone();
+        self.status.model = model.clone();
+        self.note(&format!("using {provider_name} · {model}"), false);
+    }
+
+    fn write_agents_md(&mut self) {
+        let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let path = root.join("AGENTS.md");
+        if path.exists() {
+            self.note("AGENTS.md already exists, left alone", false);
+            return;
+        }
+        let name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "this project".into());
+        let body = format!(
+            "# {name}\n\nHow to work in here.\n\n## Build and test\n\n```sh\n# the commands that \
+             matter\n```\n\n## Rules\n\n- \n"
+        );
+        match std::fs::write(&path, body) {
+            Ok(_) => self.note("wrote AGENTS.md, fill in the blanks", false),
+            Err(e) => self.note(&format!("could not write AGENTS.md: {e}"), true),
+        }
+    }
+
+    fn list_sessions(&mut self) {
+        let sessions = crate::session::Session::list();
+        if sessions.is_empty() {
+            self.note("no saved sessions yet", false);
+            return;
+        }
+        let now = crate::session::unix_now();
+        self.note(&format!("{} saved sessions, newest first:", sessions.len()), false);
+        for (id, title, updated, _) in sessions.into_iter().take(8) {
+            let age = now.saturating_sub(updated);
+            let when = if age < 3600 {
+                format!("{}m ago", age / 60)
+            } else if age < 86_400 {
+                format!("{}h ago", age / 3600)
+            } else {
+                format!("{}d ago", age / 86_400)
+            };
+            self.note(&format!("{id} · {when} · {title}"), false);
+        }
+        self.note("resume one with: harness --continue <id>", false);
+    }
+
+    /// Run a tool from the UI, showing it in the transcript like any other.
+    fn spawn_tool(&mut self, name: &str, args: &'static str) {
+        if self.local.is_some() {
+            self.note("a local check is already running", false);
+            return;
+        }
+        let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let name = name.to_string();
+        std::thread::spawn(move || {
+            let mut ctx = crate::tools::Ctx::new(root, crate::llm::http::Cancel::new(), "ui".into());
+            let _ = tx.send(AgentEvent::ToolStart { name: name.clone(), args: args.to_string() });
+            let started = std::time::Instant::now();
+            let result = crate::tools::run(&mut ctx, &name, args);
+            let ms = started.elapsed().as_millis() as u64;
+            let (ok, output) = match result {
+                Ok(text) => (true, crate::tools::clip(text)),
+                Err(err) => (false, err),
+            };
+            let _ = tx.send(AgentEvent::ToolDone { name, output, ok, ms });
+            let _ = tx.send(AgentEvent::Done);
+        });
+        self.local = Some(rx);
     }
 
     pub fn note(&mut self, text: &str, error: bool) {
@@ -599,6 +855,12 @@ impl App {
             AgentEvent::Thinking => {
                 if !matches!(self.items.last(), Some(Item::Thinking { .. })) {
                     self.items.push(Item::Thinking { born: self.now });
+                }
+            }
+            AgentEvent::Reasoning(text) => {
+                match self.items.last_mut() {
+                    Some(Item::Reasoning { text: body, .. }) => body.push_str(&text),
+                    _ => self.items.push(Item::Reasoning { text, born: self.now }),
                 }
             }
             AgentEvent::Token(t) => {
@@ -645,6 +907,15 @@ impl App {
             }
             AgentEvent::Usage { tokens_in, tokens_out, cost } => {
                 self.status.set_usage(tokens_in, tokens_out, cost, self.now);
+            }
+            AgentEvent::Notice(text) => self.note(&text, false),
+            AgentEvent::Error(text) => {
+                self.close_stream();
+                self.busy = false;
+                self.note(&text, true);
+            }
+            AgentEvent::Session(path) => {
+                self.status.session = path;
             }
             AgentEvent::Cancelled => {
                 self.close_stream();

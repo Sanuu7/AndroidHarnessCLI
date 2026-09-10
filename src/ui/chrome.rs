@@ -133,6 +133,12 @@ pub fn status(frame: &mut Frame, area: Rect, app: &App) {
         left.push(Span::styled("· ", Style::default().fg(t.c(dot))));
     }
     left.push(Span::styled(s.model.clone(), Style::default().fg(t.c(t.dim))));
+    if !s.provider.is_empty() && w >= WIDE as usize {
+        left.push(Span::styled(
+            format!(" · {}", s.provider),
+            Style::default().fg(t.c(t.faint)),
+        ));
+    }
 
     // Cost flashes toward white when it changes, and every counter walks to
     // its new value instead of jumping.
@@ -163,13 +169,33 @@ pub fn status(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(t.c(ctx_color)),
         ));
     }
+    let (cost_text, cost_color) = match s.cost {
+        // A model with no price in the table says so instead of showing a
+        // zero it cannot back up.
+        None => ("n/a".to_string(), t.faint),
+        Some(_) => (fmt_cost(s.disp_cost(now), compact), cost_color),
+    };
     right.push(Span::styled(
-        format!("{}  ", fmt_cost(s.disp_cost(now), compact)),
+        format!("{cost_text}  "),
         Style::default().fg(t.c(cost_color)),
     ));
 
-    let left_w: usize = left.iter().map(|s| width(&s.content)).sum();
-    let right_w: usize = right.iter().map(|s| width(&s.content)).sum();
+    let mut left_w: usize = left.iter().map(|s| width(&s.content)).sum();
+    let mut right_w: usize = right.iter().map(|s| width(&s.content)).sum();
+    // On a narrow phone the two halves can collide; the token counters are
+    // the first thing to go, then the model label gets clipped.
+    while left_w + right_w > w && right.len() > 2 {
+        right.remove(0);
+        right_w = right.iter().map(|s| width(&s.content)).sum();
+    }
+    if left_w + right_w > w {
+        if let Some(model) = left.last_mut() {
+            let room = w.saturating_sub(right_w + 2);
+            let text = truncate(&model.content, room);
+            model.content = text.into();
+            left_w = left.iter().map(|s| width(&s.content)).sum();
+        }
+    }
     let pad = w.saturating_sub(left_w + right_w);
     let mut spans = left;
     spans.push(Span::raw(" ".repeat(pad)));
@@ -202,7 +228,7 @@ fn ctx_meter(frac: f32, cells: usize, t: &theme::Theme) -> Vec<Span<'static>> {
 
 fn fmt_cost(cost: f64, compact: bool) -> String {
     if cost <= 0.0 {
-        return "$0".to_string();
+        return "free".to_string();
     }
     if cost < 1.0 {
         let s = format!("{cost:.4}");
@@ -222,7 +248,7 @@ mod tests {
 
     #[test]
     fn cost_formatting() {
-        assert_eq!(fmt_cost(0.0, false), "$0");
+        assert_eq!(fmt_cost(0.0, false), "free");
         assert_eq!(fmt_cost(0.0031, false), "$0.0031");
         assert_eq!(fmt_cost(0.0031, true), "$.0031");
         assert_eq!(fmt_cost(12.5, false), "$12.50");

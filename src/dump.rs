@@ -12,8 +12,8 @@ use ratatui::style::{Color, Modifier};
 use std::io::{self, Write};
 
 pub const STATES: &[&str] = &[
-    "splash", "empty", "idle", "chat", "stream", "thinking", "tools", "error", "settle", "popup",
-    "help",
+    "splash", "empty", "idle", "chat", "stream", "thinking", "reasoning", "tools", "error",
+    "settle", "popup", "help",
 ];
 
 pub fn run(args: &[String]) -> io::Result<()> {
@@ -40,7 +40,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
 
 /// Usage numbers, already settled by the time this frame is taken.
 fn usage(app: &mut App, tokens_in: u64, tokens_out: u64, cost: f64, t: u64) {
-    app.status.set_usage(tokens_in, tokens_out, cost, t.saturating_sub(900));
+    app.status.set_usage(tokens_in, tokens_out, Some(cost), t.saturating_sub(900));
     app.status.cost_flash = t.saturating_sub(400);
 }
 
@@ -50,7 +50,9 @@ fn build(state: &str, level: ColorLevel, t: u64) -> App {
     app.chat_at = 0;
     app.now = t;
     app.status.model = "glm-5.3-flash".into();
+    app.status.provider = "harness".into();
     app.status.workspace = "AndroidHarness".into();
+    app.status.session = "sessions/1767225600.json".into();
 
     match state {
         "splash" => {
@@ -136,6 +138,36 @@ fn build(state: &str, level: ColorLevel, t: u64) -> App {
             ];
             app.sent_at = t.saturating_sub(1_400);
             usage(&mut app, 5_100, 0, 0.0011, t);
+        }
+        "reasoning" => {
+            app.phase = Phase::Chat;
+            app.busy = true;
+            app.items = vec![
+                Item::User {
+                    text: "why is the tests target slow".into(),
+                    born: 0,
+                },
+                Item::Reasoning {
+                    text: "The user wants to know where the time goes in the test target. I should \
+                           check the gradle config first, then look at whether the suite is \
+                           recompiling the whole module on every run. The build cache is probably \
+                           disabled for the debug variant."
+                        .into(),
+                    born: t.saturating_sub(2_100),
+                },
+                Item::Tool {
+                    name: "grep".into(),
+                    args: "org.gradle.caching".into(),
+                    state: ToolState::Running {
+                        started: t.saturating_sub(900),
+                    },
+                    born: t.saturating_sub(1_000),
+                    expanded: false,
+                    expand_at: 0,
+                },
+            ];
+            app.sent_at = t.saturating_sub(2_400);
+            usage(&mut app, 8_900, 310, 0.0026, t);
         }
         "tools" => {
             app.phase = Phase::Chat;

@@ -176,10 +176,38 @@ fn push_code(out: &mut Vec<Line<'static>>, lang: &str, buf: &[String], theme: &T
             bg.fg(theme.c(theme.accent2)).add_modifier(Modifier::BOLD),
         )));
     }
+    let diff = lang.eq_ignore_ascii_case("diff") || lang.eq_ignore_ascii_case("patch");
     for line in buf {
         let text = pad_right(&truncate(line, width), width);
-        out.push(Line::from(Span::styled(text, bg.fg(theme.c(theme.text)))));
+        out.push(Line::from(Span::styled(
+            text,
+            bg.fg(theme.c(code_color(line, diff, theme))),
+        )));
     }
+}
+
+/// A diff should read at a glance: additions green, removals red, hunk
+/// headers violet, comments quiet.
+fn code_color(line: &str, diff: bool, theme: &Theme) -> theme::Rgb {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("+++") || trimmed.starts_with("---") {
+        return theme.faint;
+    }
+    if diff || trimmed.starts_with('@') {
+        if trimmed.starts_with('@') {
+            return theme.accent2;
+        }
+        if trimmed.starts_with('+') {
+            return theme.green;
+        }
+        if trimmed.starts_with('-') {
+            return theme.red;
+        }
+    }
+    if trimmed.starts_with('#') || trimmed.starts_with("//") {
+        return theme.faint;
+    }
+    theme.text
 }
 
 fn rule_line(width: usize, theme: &Theme) -> Line<'static> {
@@ -357,6 +385,26 @@ mod tests {
         let t = text_of(&out);
         assert!(t.iter().any(|l| l.starts_with("• one")));
         assert!(t.iter().any(|l| l.contains("quoted")));
+    }
+
+    #[test]
+    fn diffs_are_colored_by_line() {
+        let t = theme();
+        assert_eq!(code_color("+added", true, &t), t.green);
+        assert_eq!(code_color("-removed", true, &t), t.red);
+        assert_eq!(code_color("@@ -1,2 +1,2 @@", true, &t), t.accent2);
+        assert_eq!(code_color("+++ b/file.rs", true, &t), t.faint);
+        assert_eq!(code_color("context", true, &t), t.text);
+        assert_eq!(code_color("# comment", false, &t), t.faint);
+    }
+
+    #[test]
+    fn a_diff_fence_keeps_its_colors_while_streaming() {
+        let out = render("```diff\n- old\n+ new", &theme(), 40);
+        let added = out.iter().find(|l| l.spans.iter().any(|s| s.content.contains("new")));
+        assert_eq!(added.unwrap().spans[0].style.fg, Some(ratatui::style::Color::Rgb(
+            theme::GREEN.0, theme::GREEN.1, theme::GREEN.2
+        )));
     }
 
     #[test]
