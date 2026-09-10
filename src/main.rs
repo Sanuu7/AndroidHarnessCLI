@@ -112,9 +112,9 @@ usage: harness [options]
 
 keys:
   enter      send            ctrl+j     new line
-  tab        complete        ctrl+p     command palette
+  tab        complete        type /     commands and pickers
   up/down    history         pgup/pgdn  scroll back
-  ctrl+e     expand tool     ctrl+o     expand all tools
+  ctrl+e     expand tool     ctrl+o     expand everything
   ctrl+c     cancel, twice to quit      ctrl+d  quit now
   ctrl+w     delete word     ctrl+l     redraw
 

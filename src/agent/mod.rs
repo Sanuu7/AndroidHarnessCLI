@@ -20,6 +20,10 @@ use std::time::{Duration, Instant};
 /// Tool rounds before the agent stops on its own. Long enough for real work,
 /// short enough that a loop cannot run all night.
 pub const MAX_STEPS: usize = 24;
+/// Attempts per model call before the error is shown.
+const MAX_ATTEMPTS: usize = 3;
+/// Base gap between attempts; grows with each try.
+const RETRY_BACKOFF_MS: u64 = 700;
 /// Share of the context window that triggers a compaction.
 const COMPACT_AT: f64 = 0.72;
 const COMPACT_PREFIX: &str = "[Auto-compacted context: summary of the earlier conversation]";
@@ -33,6 +37,8 @@ pub enum AgentEvent {
     ToolStart { name: String, args: String },
     ToolDone { name: String, output: String, ok: bool, ms: u64 },
     Usage { tokens_in: u64, tokens_out: u64, cost: Option<f64> },
+    /// A live model list for the picker, fetched in the background.
+    Models(Vec<String>),
     /// Something worth a line of its own: retries, compaction, limits.
     Notice(String),
     Error(String),
@@ -226,29 +232,16 @@ impl Worker {
             }
             self.maybe_compact();
             emit(&self.tx, AgentEvent::Thinking);
-            let result = match self.stream_turn() {
+            let result = match self.stream_with_retries() {
                 Ok(result) => result,
                 Err(err) => {
                     if self.cancel.cancelled() {
                         emit(&self.tx, AgentEvent::Cancelled);
-                        self.finish();
-                        return;
-                    }
-                    if err.retryable {
-                        emit(&self.tx, AgentEvent::Notice(format!("{} · retrying", err.message)));
-                        match self.stream_turn() {
-                            Ok(result) => result,
-                            Err(second) => {
-                                emit(&self.tx, AgentEvent::Error(second.message));
-                                self.finish();
-                                return;
-                            }
-                        }
                     } else {
                         emit(&self.tx, AgentEvent::Error(err.message));
-                        self.finish();
-                        return;
                     }
+                    self.finish();
+                    return;
                 }
             };
 
@@ -400,6 +393,42 @@ impl Worker {
     }
 
     // -- streaming --------------------------------------------------------
+
+    /// Free tiers hiccup: a dropped connection or a 503 is worth another try
+    /// before the user ever sees it. Three attempts, backing off each time.
+    fn stream_with_retries(&mut self) -> Result<TurnResult, StreamError> {
+        let mut last: Option<StreamError> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            match self.stream_turn() {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    if !err.retryable || self.cancel.cancelled() {
+                        return Err(err);
+                    }
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        emit(
+                            &self.tx,
+                            AgentEvent::Notice(format!(
+                                "{} · retrying ({}/{MAX_ATTEMPTS})",
+                                one_line(&err.message, 80),
+                                attempt + 2
+                            )),
+                        );
+                        if !sleep_cancellable(RETRY_BACKOFF_MS * (attempt as u64 + 1), &self.cancel) {
+                            return Err(StreamError {
+                                message: "cancelled".into(),
+                                retryable: false,
+                            });
+                        }
+                        last = Some(err);
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        Err(last.unwrap_or(StreamError { message: "request failed".into(), retryable: false }))
+    }
 
     fn stream_turn(&mut self) -> Result<TurnResult, StreamError> {
         let system = prompt::build(&self.root, &self.prefs);
@@ -652,6 +681,18 @@ fn one_line(text: &str, max: usize) -> String {
         return flat;
     }
     flat.chars().take(max).collect::<String>() + "…"
+}
+
+/// Sleep in slices so a cancel lands immediately. False means cancelled.
+fn sleep_cancellable(ms: u64, cancel: &http::Cancel) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(ms) {
+        if cancel.cancelled() {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    !cancel.cancelled()
 }
 
 /// SSE payload of a line, or None for comments, events, and blanks.

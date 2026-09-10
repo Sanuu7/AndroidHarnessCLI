@@ -182,13 +182,14 @@ pub fn status(frame: &mut Frame, area: Rect, app: &App) {
 
     let mut left_w: usize = left.iter().map(|s| width(&s.content)).sum();
     let mut right_w: usize = right.iter().map(|s| width(&s.content)).sum();
-    // On a narrow phone the two halves can collide; the token counters are
-    // the first thing to go, then the model label gets clipped.
-    while left_w + right_w > w && right.len() > 2 {
+    // On a narrow phone the two halves can collide; keep at least one column
+    // of air between them, dropping the token counters first and clipping the
+    // model label after that.
+    while left_w + right_w + 1 > w && right.len() > 2 {
         right.remove(0);
         right_w = right.iter().map(|s| width(&s.content)).sum();
     }
-    if left_w + right_w > w {
+    if left_w + right_w + 1 > w {
         if let Some(model) = left.last_mut() {
             let room = w.saturating_sub(right_w + 2);
             let text = truncate(&model.content, room);

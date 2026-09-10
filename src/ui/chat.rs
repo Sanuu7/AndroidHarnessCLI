@@ -25,12 +25,30 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         welcome(frame, area, app);
         return;
     }
+    // A column of air on each side: on a phone, text that touches the glass
+    // is the difference between cramped and readable.
+    let outer = area;
+    let area = Rect {
+        x: outer.x + 1,
+        y: outer.y,
+        width: outer.width.saturating_sub(2),
+        height: outer.height,
+    };
+    if area.width < 12 {
+        return;
+    }
     let w = area.width as usize;
     let scale = app.appear(app.chat_at).max(0.15);
     let mut lines: Vec<Line> = Vec::new();
+    // Where the last thing the user said starts, so the fade mask above never
+    // dims the turn being read.
+    let mut last_user_row = 0usize;
     for item in app.items.iter() {
         if !lines.is_empty() {
             lines.push(Line::default());
+        }
+        if matches!(item, Item::User { .. }) {
+            last_user_row = lines.len();
         }
         lines.extend(item_lines(item, app, w, scale));
     }
@@ -42,10 +60,12 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let start = total.saturating_sub(h + scroll);
     let mut visible: Vec<Line> = lines.into_iter().skip(start).take(h).collect();
 
-    // When there is more above, the top rows fade out instead of being cut.
+    // The top rows fade out when there is more above, but only above the
+    // current turn.
     if start > 0 {
         let mask_rows = 2.min(visible.len());
-        for (row, line) in visible.iter_mut().take(mask_rows).enumerate() {
+        let fade_rows = last_user_row.saturating_sub(start).min(mask_rows);
+        for (row, line) in visible.iter_mut().take(fade_rows).enumerate() {
             let keep = anim::top_mask(row, mask_rows, 0.85);
             *line = fade_line(line.clone(), app.theme.bg, keep);
         }
@@ -63,7 +83,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(ratatui::text::Text::from(visible)), anchored);
 
     if scroll > 0 {
-        draw_scroll_hint(frame, area, app, scroll);
+        draw_scroll_hint(frame, outer, app, scroll);
     }
 }
 
@@ -158,7 +178,9 @@ fn item_lines(item: &Item, app: &App, w: usize, scale: f32) -> Vec<Line<'static>
             ..
         } => assistant_lines(text, *streaming, *finished, app, w, alpha),
         Item::Thinking { born } => thinking_lines(app, *born, w, alpha),
-        Item::Reasoning { text, .. } => reasoning_lines(app, text, w, alpha),
+        Item::Reasoning { text, born, finished } => {
+            reasoning_lines(app, text, *born, *finished, w, alpha)
+        }
         Item::Tool {
             name,
             args,
@@ -175,14 +197,44 @@ fn item_lines(item: &Item, app: &App, w: usize, scale: f32) -> Vec<Line<'static>
     }
 }
 
-/// Reasoning streams are context, not the answer: quiet, clamped to a few
-/// lines, and they never shout over the reply that follows them.
-fn reasoning_lines(app: &App, text: &str, w: usize, alpha: f32) -> Vec<Line<'static>> {
+/// Reasoning is context, not the answer. While it streams it shows the tail
+/// with a breathing gutter; once the answer starts it collapses to one quiet
+/// line, so a finished turn is not half thinking.
+fn reasoning_lines(
+    app: &App,
+    text: &str,
+    born: u64,
+    finished: u64,
+    w: usize,
+    alpha: f32,
+) -> Vec<Line<'static>> {
     let t = &app.theme;
+    if finished > 0 && !app.expand {
+        let secs = (finished.saturating_sub(born)) as f32 / 1000.0;
+        let label = if secs >= 1.0 {
+            format!("thought for {secs:.0}s")
+        } else {
+            "thought for a moment".to_string()
+        };
+        return vec![Line::from(vec![
+            Span::raw(" ".repeat(BODY_INDENT)),
+            Span::styled(
+                "│ ".to_string(),
+                Style::default().fg(t.fade(t.faint, alpha * 0.5)),
+            ),
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(t.fade(t.faint, alpha * 0.8))
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ])];
+    }
+
     let budget = w.saturating_sub(BODY_INDENT + 2).max(8);
     let flat = text.replace('\n', " ");
     let rows = wrap(&flat, budget);
-    let shown = rows.len().min(3);
+    let shown = if app.expand { rows.len() } else { rows.len().min(3) };
     let start = rows.len().saturating_sub(shown);
     let mut out: Vec<Line<'static>> = Vec::new();
     // A breathing dot marks the stream while it is still arriving.

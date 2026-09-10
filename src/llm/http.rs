@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 /// Marker curl prints after the body, carrying the status code.
 const STATUS_MARK: &str = "\u{1}HTTP\u{1}";
@@ -147,6 +148,89 @@ pub fn post(req: HttpReq, cancel: Cancel) -> Result<Receiver<HttpMsg>, String> {
         }
     });
     Ok(rx)
+}
+
+/// A blocking GET: for the small calls that fill a picker, where waiting a
+/// second matters less than keeping the streaming path simple.
+pub fn get(
+    url: &str,
+    headers: &[(String, String)],
+    cancel: Cancel,
+    timeout_ms: u64,
+) -> Result<String, String> {
+    let mut cmd = Command::new("curl");
+    cmd.arg("-sS")
+        .arg("-L")
+        .arg("--max-time")
+        .arg((timeout_ms / 1000).max(1).to_string())
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in headers {
+        cmd.arg("-H").arg(format!("{k}: {v}"));
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("curl: {e}"))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    if let Ok(mut slot) = cancel.child.lock() {
+        *slot = Some(child);
+    }
+    // Drain both pipes on their own threads: a full pipe would otherwise
+    // stall the process we are waiting on.
+    let (out_tx, out_rx) = channel::<String>();
+    let (err_tx, err_rx) = channel::<String>();
+    if let Some(pipe) = stdout {
+        thread::spawn(move || {
+            let _ = out_tx.send(read_all(pipe));
+        });
+    }
+    if let Some(pipe) = stderr {
+        thread::spawn(move || {
+            let _ = err_tx.send(read_all(pipe));
+        });
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms + 1_000);
+    // The lock is taken per poll, never across the wait: cancelling from the
+    // UI thread has to stay instant while this is running.
+    let status = loop {
+        let mut done = None;
+        {
+            let mut slot = cancel.child.lock().map_err(|_| "curl: poisoned lock".to_string())?;
+            let Some(child) = slot.as_mut() else { return Err("curl: lost the process".into()) };
+            match child.try_wait() {
+                Ok(Some(status)) => done = Some(status),
+                Ok(None) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+            if done.is_none()
+                && (cancel.cancelled() || std::time::Instant::now() > deadline)
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("cancelled".into());
+            }
+        }
+        if let Some(status) = done {
+            break status;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let body = out_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
+    let err = err_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
+    if !status.success() {
+        let message = err.trim();
+        return Err(if message.is_empty() { "request failed".into() } else { message.into() });
+    }
+    Ok(body)
+}
+
+fn read_all(pipe: impl std::io::Read) -> String {
+    let mut buf = Vec::new();
+    let mut pipe = pipe;
+    let _ = pipe.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).to_string()
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@
 pub mod anthropic;
 pub mod gemini;
 pub mod http;
+pub mod models;
 pub mod openai;
 pub mod relay;
 pub mod responses;

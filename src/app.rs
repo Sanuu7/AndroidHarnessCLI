@@ -16,6 +16,29 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 pub const SPLASH_MS: u64 = 1500;
 
+/// "12m ago", for session lists.
+fn age(now: u64, then: u64) -> String {
+    let secs = now.saturating_sub(then);
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3_600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3_600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+/// Second line of a model row: the one thing worth knowing about it here.
+fn model_hint(id: &str, provider: &str) -> String {
+    if crate::llm::models::free_slot(id) {
+        "free".to_string()
+    } else {
+        provider.to_string()
+    }
+}
+
 #[derive(PartialEq, Clone, Copy)]
 pub enum Phase {
     Splash,
@@ -54,6 +77,8 @@ pub enum Item {
     Reasoning {
         text: String,
         born: u64,
+        /// When the answer started, so the block can collapse to one line.
+        finished: u64,
     },
     Tool {
         name: String,
@@ -71,8 +96,7 @@ pub enum Item {
 }
 
 impl Item {
-    pub fn born(&self) -> u64 {
-        match self {
+    pub fn born(&self) -> u64 {        match self {
             Item::User { born, .. }
             | Item::Assistant { born, .. }
             | Item::Thinking { born }
@@ -189,13 +213,77 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "new", args: "", desc: "start a fresh session" },
     Command { name: "provider", args: "[name]", desc: "switch or list providers" },
     Command { name: "quit", args: "", desc: "leave" },
-    Command { name: "sessions", args: "", desc: "past sessions" },
+    Command { name: "sessions", args: "[id]", desc: "resume a past session" },
     Command { name: "skills", args: "", desc: "list installed skills" },
     Command { name: "theme", args: "", desc: "match your terminal" },
 ];
 
+/// Commands that open a list instead of acting right away.
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum Pick {
+    Model,
+    Provider,
+    Session,
+}
+
+impl Pick {
+    pub fn of(command: &str) -> Option<Pick> {
+        match command {
+            "model" => Some(Pick::Model),
+            "provider" => Some(Pick::Provider),
+            "sessions" | "resume" => Some(Pick::Session),
+            _ => None,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Pick::Model => "model",
+            Pick::Provider => "provider",
+            Pick::Session => "session",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Pick::Model => "enter to switch, type to filter or add",
+            Pick::Provider => "enter to switch",
+            Pick::Session => "enter to resume",
+        }
+    }
+}
+
+/// One row in a picker.
+#[derive(Clone)]
+pub struct Choice {
+    pub label: String,
+    pub hint: String,
+    /// The value that gets applied, which can differ from the label.
+    pub value: String,
+    pub current: bool,
+}
+
+impl Choice {
+    pub fn new(label: impl Into<String>, hint: impl Into<String>) -> Self {
+        let label = label.into();
+        Self { value: label.clone(), label, hint: hint.into(), current: false }
+    }
+
+    pub fn current(mut self, yes: bool) -> Self {
+        self.current = yes;
+        self
+    }
+}
+
+/// The popup above the composer: the command palette, or a list to pick from.
 pub struct Popup {
+    /// None while the command palette is up.
+    pub pick: Option<Pick>,
+    /// Text typed after the command name, used to filter.
     pub filter: String,
+    pub choices: Vec<Choice>,
+    /// A live list is on the way; the footer says so.
+    pub loading: bool,
     pub sel: usize,
     pub opened_at: u64,
     /// Where the highlight was before, so it can cross-fade between rows.
@@ -204,14 +292,60 @@ pub struct Popup {
 }
 
 impl Popup {
-    pub fn new(filter: String, now: u64) -> Self {
+    pub fn commands(filter: String, now: u64) -> Self {
         Self {
+            pick: None,
             filter,
+            choices: Vec::new(),
+            loading: false,
             sel: 0,
             opened_at: now,
             sel_prev: 0,
             sel_at: now,
         }
+    }
+
+    pub fn picker(pick: Pick, filter: String, choices: Vec<Choice>, now: u64) -> Self {
+        let sel = choices.iter().position(|c| c.current).unwrap_or(0);
+        Self {
+            pick: Some(pick),
+            filter,
+            choices,
+            loading: false,
+            sel,
+            opened_at: now,
+            sel_prev: sel,
+            sel_at: now,
+        }
+    }
+
+    pub fn commands_matching(&self) -> Vec<&'static Command> {
+        let f = self.filter.to_lowercase();
+        COMMANDS
+            .iter()
+            .filter(|c| c.name.starts_with(&f) || c.name.contains(&f))
+            .collect()
+    }
+
+    /// Rows the user can see right now: the filtered choices.
+    pub fn visible(&self) -> Vec<&Choice> {
+        let f = self.filter.trim().to_lowercase();
+        self.choices
+            .iter()
+            .filter(|c| f.is_empty() || c.label.to_lowercase().contains(&f))
+            .collect()
+    }
+
+    pub fn rows(&self) -> usize {
+        match self.pick {
+            Some(_) => self.visible().len(),
+            None => self.commands_matching().len(),
+        }
+    }
+
+    /// The highlighted row, if the list has one.
+    pub fn selected(&self) -> Option<Choice> {
+        self.visible().get(self.sel).map(|c| (*c).clone())
     }
 
     /// Move the highlight, remembering where it came from.
@@ -222,15 +356,21 @@ impl Popup {
             self.sel_at = now;
         }
     }
-}
 
-impl Popup {
-    pub fn matches(&self) -> Vec<&'static Command> {
-        let f = self.filter.to_lowercase();
-        COMMANDS
-            .iter()
-            .filter(|c| c.name.starts_with(&f) || c.name.contains(&f))
-            .collect()
+    /// Replace the choice list, keeping the highlight on something sensible.
+    pub fn set_choices(&mut self, choices: Vec<Choice>, now: u64) {
+        let was = self.selected().map(|c| c.value);
+        self.choices = choices;
+        self.loading = false;
+        let sel = match &was {
+            Some(value) => self
+                .visible()
+                .iter()
+                .position(|c| &c.value == value)
+                .unwrap_or_else(|| self.visible().iter().position(|c| c.current).unwrap_or(0)),
+            None => self.visible().iter().position(|c| c.current).unwrap_or(0),
+        };
+        self.select(sel, now);
     }
 }
 
@@ -262,6 +402,8 @@ pub struct App {
     pub config: Option<crate::config::Config>,
     /// Events from tool runs the UI started itself, such as /doctor.
     local: Option<Receiver<AgentEvent>>,
+    /// Reasoning blocks and tool cards stay open after ctrl+o.
+    pub expand: bool,
     /// Workspace preferences handed to the agent at startup.
     pub prefs: Vec<String>,
 }
@@ -291,6 +433,7 @@ impl App {
             agent: None,
             config: None,
             local: None,
+            expand: false,
             prefs: Vec::new(),
         }
     }
@@ -447,18 +590,19 @@ impl App {
 
         if self.popup.is_some() {
             match key.code {
-                KeyCode::Up => {
+                KeyCode::Up | KeyCode::BackTab => {
                     let now = self.now;
                     if let Some(p) = &mut self.popup {
-                        p.select(p.sel.saturating_sub(1), now);
+                        let rows = p.rows();
+                        p.select(p.sel.saturating_sub(1).min(rows.saturating_sub(1)), now);
                     }
                     return;
                 }
                 KeyCode::Down => {
                     let now = self.now;
                     if let Some(p) = &mut self.popup {
-                        let n = p.matches().len();
-                        p.select((p.sel + 1).min(n.saturating_sub(1)), now);
+                        let rows = p.rows();
+                        p.select((p.sel + 1).min(rows.saturating_sub(1)), now);
                     }
                     return;
                 }
@@ -554,6 +698,7 @@ impl App {
     /// Open every card in the transcript, or close them all.
     fn toggle_expand_all(&mut self) {
         let any_open = self.items.iter().any(|i| matches!(i, Item::Tool { expanded: true, .. }));
+        self.expand = !any_open;
         let now = self.now;
         for item in self.items.iter_mut() {
             if let Item::Tool { expanded, expand_at, .. } = item {
@@ -565,38 +710,167 @@ impl App {
 
     fn sync_popup(&mut self) {
         let text = self.input.text();
-        let is_cmd = text.starts_with('/') && !text.contains('\n') && !text[1..].contains(' ');
-        if is_cmd {
-            let filter = text[1..].to_string();
-            let now = self.now;
+        if !text.starts_with('/') || text.contains('\n') {
+            self.popup = None;
+            return;
+        }
+        let now = self.now;
+        let body = &text[1..];
+        // "/model lin" is a picker with a filter. "/model" on its own is still
+        // the command palette, so the name can be finished with tab.
+        if let Some((name, filter)) = body.split_once(' ') {
+            if let Some(pick) = Pick::of(name) {
+                let filter = filter.to_string();
+                let same = matches!(&self.popup, Some(p) if p.pick == Some(pick));
+                if same {
+                    if let Some(p) = &mut self.popup {
+                        if p.filter != filter {
+                            p.filter = filter;
+                            let rows = p.rows();
+                            p.select(0.min(rows.saturating_sub(1)), now);
+                        }
+                    }
+                    return;
+                }
+                let choices = self.choices_for(pick);
+                let empty = choices.is_empty();
+                self.popup = Some(Popup::picker(pick, filter, choices, now));
+                if empty || pick == Pick::Model {
+                    self.load_models();
+                }
+                return;
+            }
+        }
+        if !body.contains(' ') {
             match &mut self.popup {
-                Some(p) => {
-                    if p.filter != filter {
-                        p.filter = filter;
+                Some(p) if p.pick.is_none() => {
+                    if p.filter != body {
+                        p.filter = body.to_string();
                         p.select(0, now);
                     }
                 }
-                None => self.popup = Some(Popup::new(filter, now)),
+                _ => self.popup = Some(Popup::commands(body.to_string(), now)),
             }
         } else {
             self.popup = None;
         }
     }
 
+    /// Rows for a picker, from whatever the config already knows.
+    fn choices_for(&self, pick: Pick) -> Vec<Choice> {
+        match pick {
+            Pick::Model => {
+                let current = self.status.model.clone();
+                let provider = self.status.provider.clone();
+                let mut ids: Vec<String> = self
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.find(&provider).cloned())
+                    .map(|p| p.models)
+                    .unwrap_or_default();
+                if !ids.iter().any(|m| m == &current) {
+                    ids.insert(0, current.clone());
+                }
+                ids.sort();
+                ids.dedup();
+                ids.into_iter()
+                    .map(|id| {
+                        Choice::new(id.clone(), model_hint(&id, &provider)).current(id == current)
+                    })
+                    .collect()
+            }
+            Pick::Provider => self
+                .config
+                .as_ref()
+                .map(|c| {
+                    c.providers
+                        .iter()
+                        .map(|p| {
+                            Choice::new(p.name.clone(), p.kind.as_str())
+                                .current(p.name == self.status.provider)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Pick::Session => {
+                let now = crate::session::unix_now();
+                crate::session::Session::list()
+                    .into_iter()
+                    .take(30)
+                    .map(|(_id, title, updated, path)| {
+                        let mut choice = Choice::new(title, age(now, updated));
+                        choice.value = path.display().to_string();
+                        choice
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Ask the provider what it serves, and fill the picker when it answers.
+    fn load_models(&mut self) {
+        if self.local.is_some() {
+            return;
+        }
+        let provider = self
+            .config
+            .as_ref()
+            .and_then(|c| c.find(&self.status.provider).cloned());
+        let Some(provider) = provider else { return };
+        if let Some(popup) = self.popup.as_mut() {
+            popup.loading = true;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let models = crate::llm::models::list(&provider).unwrap_or_default();
+            let _ = tx.send(AgentEvent::Models(models));
+        });
+        self.local = Some(rx);
+    }
+
     fn accept_popup(&mut self) {
-        let Some(p) = &self.popup else { return };
-        let matches = p.matches();
-        let Some(cmd) = matches.get(p.sel).copied() else {
+        let Some(popup) = &self.popup else { return };
+        let pick = popup.pick;
+        let selected = popup.selected().map(|c| c.value);
+        let typed = popup.filter.trim().to_string();
+        let Some(pick) = pick else {
+            let matches = popup.commands_matching();
+            let Some(cmd) = matches.get(popup.sel).copied() else {
+                self.popup = None;
+                return;
+            };
             self.popup = None;
+            if cmd.args.is_empty() {
+                // No arguments: run it like the user typed it.
+                self.input.set_text(&format!("/{}", cmd.name));
+                self.send();
+            } else {
+                self.input.set_text(&format!("/{} ", cmd.name));
+            }
             return;
         };
         self.popup = None;
-        if cmd.args.is_empty() {
-            // No arguments: run it like the user typed it.
-            self.input.set_text(&format!("/{}", cmd.name));
-            self.send();
-        } else {
-            self.input.set_text(&format!("/{} ", cmd.name));
+        self.input.clear();
+        match pick {
+            Pick::Model => {
+                // Nothing matched but something was typed: take it as a model
+                // name, which is how a new one gets added.
+                let name = selected.clone().unwrap_or_else(|| typed.clone());
+                if name.trim().is_empty() {
+                    return;
+                }
+                self.apply_model(&name);
+            }
+            Pick::Provider => {
+                if let Some(name) = selected {
+                    self.apply_provider(&name);
+                }
+            }
+            Pick::Session => {
+                if let Some(path) = selected {
+                    self.resume_session(&path);
+                }
+            }
         }
     }
 
@@ -677,7 +951,13 @@ impl App {
             "doctor" => self.spawn_tool("doctor", "{\"network\":\"skip\"}"),
             "skills" => self.spawn_tool("skills_list", "{}"),
             "init" => self.write_agents_md(),
-            "sessions" => self.list_sessions(),
+            "sessions" => {
+                if rest.is_empty() {
+                    self.open_picker(Pick::Session);
+                } else {
+                    self.resume_named(&rest);
+                }
+            }
             "theme" => {
                 let level = match self.theme.level {
                     crate::theme::ColorLevel::True => "truecolor",
@@ -692,23 +972,35 @@ impl App {
                     false,
                 );
             }
-            "model" => self.switch_model(&rest),
-            "provider" => self.switch_provider(&rest),
+            "model" => {
+                if rest.is_empty() {
+                    self.open_picker(Pick::Model);
+                } else {
+                    self.apply_model(&rest);
+                }
+            }
+            "provider" => {
+                if rest.is_empty() {
+                    self.open_picker(Pick::Provider);
+                } else {
+                    self.apply_provider(&rest);
+                }
+            }
             "quit" | "q" => self.quit = true,
             "" => {}
             other => self.note(&format!("unknown command: /{other}"), true),
         }
     }
 
-    fn switch_model(&mut self, name: &str) {
+    /// Put the command into the composer and let the picker logic open.
+    fn open_picker(&mut self, pick: Pick) {
+        self.input.set_text(&format!("/{} ", pick.title()));
+        self.sync_popup();
+    }
+
+    fn apply_model(&mut self, name: &str) {
         let name = name.trim();
         if name.is_empty() {
-            let model = self.status.model.clone();
-            let provider = self.status.provider.clone();
-            self.note(
-                &format!("model: {model} · provider {provider} · switch with /model <name>"),
-                false,
-            );
             return;
         }
         let current = self.status.provider.clone();
@@ -732,9 +1024,9 @@ impl App {
         self.note(&format!("model set to {name}"), false);
     }
 
-    fn switch_provider(&mut self, name: &str) {
+    fn apply_provider(&mut self, name: &str) {
         let name = name.trim();
-        let models = self
+        let known = self
             .config
             .as_ref()
             .map(|c| {
@@ -746,7 +1038,7 @@ impl App {
             .unwrap_or_default();
         if name.is_empty() {
             let current = self.status.provider.clone();
-            self.note(&format!("providers: {} · on {current}", models.join(", ")), false);
+            self.note(&format!("providers: {} · on {current}", known.join(", ")), false);
             return;
         }
         let Some(cfg) = self.config.as_mut() else {
@@ -754,7 +1046,7 @@ impl App {
             return;
         };
         let Some(provider) = cfg.find(name).cloned() else {
-            self.note(&format!("unknown provider '{name}'. known: {}", models.join(", ")), true);
+            self.note(&format!("unknown provider '{name}'. known: {}", known.join(", ")), true);
             return;
         };
         let model = provider
@@ -793,26 +1085,72 @@ impl App {
         }
     }
 
-    fn list_sessions(&mut self) {
-        let sessions = crate::session::Session::list();
-        if sessions.is_empty() {
-            self.note("no saved sessions yet", false);
+    /// Resume the newest session whose id starts with this, or whose title
+    /// contains it, since typing a long id on a phone is nobody's idea of fun.
+    fn resume_named(&mut self, want: &str) {
+        let dir = crate::session::Session::dir();
+        let exact = dir.join(format!("{want}.json"));
+        let path = if exact.exists() {
+            Some(exact)
+        } else {
+            crate::session::Session::list()
+                .into_iter()
+                .find(|(id, title, _, _)| {
+                    id.starts_with(want) || title.to_lowercase().contains(&want.to_lowercase())
+                })
+                .map(|(_, _, _, path)| path)
+        };
+        match path {
+            Some(path) => self.resume_session(&path.display().to_string()),
+            None => self.note(&format!("no session matching '{want}'"), true),
+        }
+    }
+
+    fn resume_session(&mut self, path: &str) {
+        let Some(session) = crate::session::Session::load(&std::path::PathBuf::from(path)) else {
+            self.note("that session could not be read", true);
             return;
+        };
+        let Some(agent) = &self.agent else {
+            self.note("no engine attached", true);
+            return;
+        };
+        self.items.clear();
+        for msg in &session.messages {
+            match msg.role {
+                crate::llm::Role::User => self.items.push(Item::User {
+                    text: msg.text.clone(),
+                    born: self.now,
+                }),
+                crate::llm::Role::Assistant => self.items.push(Item::Assistant {
+                    text: msg.text.clone(),
+                    born: self.now,
+                    streaming: false,
+                    finished: 0,
+                }),
+                crate::llm::Role::Tool => self.items.push(Item::Tool {
+                    name: msg.name.clone(),
+                    args: String::new(),
+                    state: ToolState::Done {
+                        ok: !msg.error,
+                        ms: 0,
+                        output: msg.text.clone(),
+                        at: self.now,
+                    },
+                    born: self.now,
+                    expanded: false,
+                    expand_at: 0,
+                }),
+            }
         }
-        let now = crate::session::unix_now();
-        self.note(&format!("{} saved sessions, newest first:", sessions.len()), false);
-        for (id, title, updated, _) in sessions.into_iter().take(8) {
-            let age = now.saturating_sub(updated);
-            let when = if age < 3600 {
-                format!("{}m ago", age / 60)
-            } else if age < 86_400 {
-                format!("{}h ago", age / 3600)
-            } else {
-                format!("{}d ago", age / 86_400)
-            };
-            self.note(&format!("{id} · {when} · {title}"), false);
+        let title = session.title.clone();
+        let messages = session.messages.len();
+        let model = session.model.clone();
+        agent.load(session);
+        self.note(&format!("resumed {title} ({messages} messages)"), false);
+        if !model.is_empty() && model != self.status.model {
+            self.note(&format!("that session used {model}"), false);
         }
-        self.note("resume one with: harness --continue <id>", false);
     }
 
     /// Run a tool from the UI, showing it in the transcript like any other.
@@ -853,20 +1191,25 @@ impl App {
     pub fn on_agent(&mut self, ev: AgentEvent) {
         match ev {
             AgentEvent::Thinking => {
-                if !matches!(self.items.last(), Some(Item::Thinking { .. })) {
-                    self.items.push(Item::Thinking { born: self.now });
-                }
+                self.clear_thinking();
+                self.items.push(Item::Thinking { born: self.now });
             }
             AgentEvent::Reasoning(text) => {
+                // The placeholder has done its job the moment thinking starts
+                // arriving, and it must never outlive the answer.
+                self.clear_thinking();
                 match self.items.last_mut() {
                     Some(Item::Reasoning { text: body, .. }) => body.push_str(&text),
-                    _ => self.items.push(Item::Reasoning { text, born: self.now }),
+                    _ => self.items.push(Item::Reasoning {
+                        text,
+                        born: self.now,
+                        finished: 0,
+                    }),
                 }
             }
             AgentEvent::Token(t) => {
-                if matches!(self.items.last(), Some(Item::Thinking { .. })) {
-                    self.items.pop();
-                }
+                self.clear_thinking();
+                self.settle_reasoning();
                 match self.items.last_mut() {
                     Some(Item::Assistant { text, streaming, .. }) if *streaming => text.push_str(&t),
                     _ => self.items.push(Item::Assistant {
@@ -878,6 +1221,8 @@ impl App {
                 }
             }
             AgentEvent::ToolStart { name, args } => {
+                self.clear_thinking();
+                self.settle_reasoning();
                 self.close_stream();
                 self.items.push(Item::Tool {
                     name,
@@ -908,6 +1253,7 @@ impl App {
             AgentEvent::Usage { tokens_in, tokens_out, cost } => {
                 self.status.set_usage(tokens_in, tokens_out, cost, self.now);
             }
+            AgentEvent::Models(models) => self.fill_models(models),
             AgentEvent::Notice(text) => self.note(&text, false),
             AgentEvent::Error(text) => {
                 self.close_stream();
@@ -930,10 +1276,52 @@ impl App {
         }
     }
 
-    fn close_stream(&mut self) {
-        if matches!(self.items.last(), Some(Item::Thinking { .. })) {
-            self.items.pop();
+    /// A live model list arrived: fold it into the open picker.
+    fn fill_models(&mut self, models: Vec<String>) {
+        if models.is_empty() {
+            return;
         }
+        let current = self.status.model.clone();
+        let provider = self.status.provider.clone();
+        let mut choices = vec![Choice::new(current.clone(), model_hint(&current, &provider))
+            .current(true)];
+        for id in models {
+            if id != current {
+                let hint = model_hint(&id, &provider);
+                choices.push(Choice::new(id, hint));
+            }
+        }
+        let now = self.now;
+        if let Some(popup) = self.popup.as_mut() {
+            if popup.pick == Some(Pick::Model) {
+                popup.set_choices(choices, now);
+            }
+        }
+    }
+
+    /// Drop the "waiting for the first token" placeholder. It is only ever
+    /// true before anything has arrived, so anything real removes it.
+    fn clear_thinking(&mut self) {
+        self.items.retain(|i| !matches!(i, Item::Thinking { .. }));
+    }
+
+    /// The reasoning block is over once the answer or a tool call starts.
+    fn settle_reasoning(&mut self) {
+        if let Some(Item::Reasoning { finished, .. }) = self
+            .items
+            .iter_mut()
+            .rev()
+            .find(|i| matches!(i, Item::Reasoning { .. }))
+        {
+            if *finished == 0 {
+                *finished = self.now;
+            }
+        }
+    }
+
+    fn close_stream(&mut self) {
+        self.clear_thinking();
+        self.settle_reasoning();
         if let Some(Item::Assistant {
             streaming,
             finished,
@@ -964,5 +1352,130 @@ impl App {
     /// Fade-in factor for things that just appeared.
     pub fn appear(&self, born: u64) -> f32 {
         Tween::new(240, anim::Ease::OutCubic).t(self.now, born)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::ColorLevel;
+
+    fn app() -> App {
+        let mut app = App::new(Theme::forced(ColorLevel::True));
+        app.now = 10_000;
+        app
+    }
+
+    fn has_thinking(app: &App) -> bool {
+        app.items.iter().any(|i| matches!(i, Item::Thinking { .. }))
+    }
+
+    #[test]
+    fn the_thinking_placeholder_never_outlives_the_answer() {
+        let mut app = app();
+        app.on_agent(AgentEvent::Thinking);
+        assert!(has_thinking(&app));
+        app.on_agent(AgentEvent::Token("here".into()));
+        assert!(!has_thinking(&app), "the spinner must not sit above the answer");
+        assert!(matches!(app.items.last(), Some(Item::Assistant { .. })));
+    }
+
+    #[test]
+    fn reasoning_also_clears_the_placeholder() {
+        let mut app = app();
+        app.on_agent(AgentEvent::Thinking);
+        app.on_agent(AgentEvent::Reasoning("hmm".into()));
+        assert!(!has_thinking(&app));
+        assert!(matches!(app.items.last(), Some(Item::Reasoning { .. })));
+        // A second chunk appends instead of opening a new block.
+        app.on_agent(AgentEvent::Reasoning(" more".into()));
+        assert_eq!(app.items.len(), 1);
+        match &app.items[0] {
+            Item::Reasoning { text, .. } => assert_eq!(text, "hmm more"),
+            _ => panic!("expected reasoning"),
+        }
+    }
+
+    #[test]
+    fn reasoning_collapses_when_the_answer_starts() {
+        let mut app = app();
+        app.on_agent(AgentEvent::Reasoning("thinking about it".into()));
+        app.now = 12_500;
+        app.on_agent(AgentEvent::Token("answer".into()));
+        match &app.items[0] {
+            Item::Reasoning { finished, .. } => {
+                assert_eq!(*finished, 12_500, "the block knows when it ended")
+            }
+            _ => panic!("expected reasoning"),
+        }
+    }
+
+    #[test]
+    fn a_tool_call_ends_the_reasoning_too() {
+        let mut app = app();
+        app.on_agent(AgentEvent::Reasoning("let me look".into()));
+        app.on_agent(AgentEvent::ToolStart { name: "grep".into(), args: "{}".into() });
+        match &app.items[0] {
+            Item::Reasoning { finished, .. } => assert!(*finished > 0),
+            _ => panic!("expected reasoning"),
+        }
+        assert!(matches!(app.items.last(), Some(Item::Tool { .. })));
+    }
+
+    #[test]
+    fn the_picker_filters_and_selects() {
+        let choices = vec![
+            Choice::new("gpt-5", "openai"),
+            Choice::new("gpt-5-mini", "openai").current(true),
+            Choice::new("o3", "openai"),
+        ];
+        let mut popup = Popup::picker(Pick::Model, String::new(), choices, 0);
+        assert_eq!(popup.rows(), 3);
+        assert_eq!(popup.sel, 1, "opens on the current model");
+        assert_eq!(popup.selected().unwrap().label, "gpt-5-mini");
+        popup.filter = "o3".into();
+        assert_eq!(popup.rows(), 1);
+        popup.select(0, 5);
+        assert_eq!(popup.selected().unwrap().label, "o3");
+    }
+
+    #[test]
+    fn a_typed_name_that_matches_nothing_is_not_a_selection() {
+        let choices = vec![Choice::new("gpt-5", "openai")];
+        let popup = Popup::picker(Pick::Model, "my-own-model".into(), choices, 0);
+        assert!(popup.selected().is_none());
+        assert_eq!(popup.filter, "my-own-model");
+    }
+
+    #[test]
+    fn live_models_keep_the_highlight_on_the_same_row() {
+        let choices = vec![
+            Choice::new("a", "p").current(true),
+            Choice::new("b", "p"),
+        ];
+        let mut popup = Popup::picker(Pick::Model, String::new(), choices, 0);
+        popup.select(1, 10);
+        let mut fresh = vec![Choice::new("a", "p").current(true)];
+        fresh.push(Choice::new("b", "p"));
+        fresh.push(Choice::new("c", "p"));
+        popup.set_choices(fresh, 20);
+        assert_eq!(popup.selected().unwrap().label, "b", "the row under the cursor stays");
+        assert!(!popup.loading);
+    }
+
+    #[test]
+    fn command_palette_still_filters_commands() {
+        let popup = Popup::commands("mo".into(), 0);
+        let names: Vec<&str> = popup.commands_matching().iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["model"]);
+        assert_eq!(popup.rows(), 1);
+    }
+
+    #[test]
+    fn pick_titles_open_the_right_list() {
+        assert_eq!(Pick::of("model"), Some(Pick::Model));
+        assert_eq!(Pick::of("provider"), Some(Pick::Provider));
+        assert_eq!(Pick::of("sessions"), Some(Pick::Session));
+        assert_eq!(Pick::of("cost"), None);
     }
 }

@@ -4,7 +4,7 @@
 //! moment into ANSI text on stdout. It is how the UI gets reviewed (and
 //! screenshotted) without a terminal to drive.
 
-use crate::app::{App, Item, Phase, Popup, ToolState};
+use crate::app::{App, Choice, Item, Phase, Pick, Popup, ToolState};
 use crate::theme::{ColorLevel, Theme};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -12,8 +12,8 @@ use ratatui::style::{Color, Modifier};
 use std::io::{self, Write};
 
 pub const STATES: &[&str] = &[
-    "splash", "empty", "idle", "chat", "stream", "thinking", "reasoning", "tools", "error",
-    "settle", "popup", "help",
+    "splash", "empty", "idle", "chat", "stream", "thinking", "reasoning", "thought", "tools",
+    "error", "settle", "popup", "models", "help",
 ];
 
 pub fn run(args: &[String]) -> io::Result<()> {
@@ -154,6 +154,7 @@ fn build(state: &str, level: ColorLevel, t: u64) -> App {
                            disabled for the debug variant."
                         .into(),
                     born: t.saturating_sub(2_100),
+                    finished: 0,
                 },
                 Item::Tool {
                     name: "grep".into(),
@@ -275,9 +276,57 @@ fn build(state: &str, level: ColorLevel, t: u64) -> App {
                 born: 0,
             }];
             app.input.set_text("/");
-            let mut popup = Popup::new(String::new(), t.saturating_sub(900));
+            let mut popup = Popup::commands(String::new(), t.saturating_sub(900));
             popup.select(1, t.saturating_sub(120));
             app.popup = Some(popup);
+        }
+        "models" => {
+            app.phase = Phase::Chat;
+            app.items = vec![Item::User {
+                text: "switch to something cheaper".into(),
+                born: 0,
+            }];
+            app.input.set_text("/model ");
+            let choices = [
+                ("claude-sonnet-4-5", "harness"),
+                ("deepseek-v4-flash-free", "harness"),
+                ("ling-3.0-flash-fin-free", "current"),
+                ("mimo-v2.5-free", "harness"),
+                ("nemotron-3.5-lightning-free", "harness"),
+            ]
+            .iter()
+            .map(|(id, hint)| Choice::new(*id, *hint).current(*hint == "current"))
+            .collect();
+            let mut popup = Popup::picker(Pick::Model, String::new(), choices, t.saturating_sub(900));
+            popup.select(3, t.saturating_sub(120));
+            app.popup = Some(popup);
+        }
+        "thought" => {
+            // A finished turn: the reasoning has collapsed to one line.
+            app.phase = Phase::Chat;
+            app.items = vec![
+                Item::User {
+                    text: "why is the tests target slow".into(),
+                    born: 0,
+                },
+                Item::Reasoning {
+                    text: "The gradle build cache is off for the debug variant, so every test run \
+                           recompiles the module."
+                        .into(),
+                    born: 300,
+                    finished: 2_400,
+                },
+                Item::Assistant {
+                    text: "The test target recompiles the whole module on every run because the \
+                           build cache is disabled for the debug variant. Turn it on in \
+                           `gradle.properties` and the second run drops to a couple of seconds."
+                        .into(),
+                    born: 2_400,
+                    streaming: false,
+                    finished: t.saturating_sub(600),
+                },
+            ];
+            usage(&mut app, 8_900, 310, 0.0026, t);
         }
         "help" => {
             app.phase = Phase::Chat;

@@ -14,10 +14,11 @@ const KEYS: &[(&str, &str)] = &[
     ("enter", "send"),
     ("ctrl+j", "new line"),
     ("tab", "complete command"),
-    ("ctrl+p", "command palette"),
-    ("up / down", "history"),
+    ("type /", "commands and pickers"),
+    ("up / down", "history or list"),
     ("pgup / pgdn", "scroll back"),
     ("ctrl+e", "expand last tool"),
+    ("ctrl+o", "expand everything"),
     ("ctrl+w", "delete word"),
     ("ctrl+u", "clear input"),
     ("ctrl+c", "cancel, twice to quit"),
@@ -28,7 +29,7 @@ const KEYS: &[(&str, &str)] = &[
 pub fn draw(frame: &mut Frame, screen: Rect, app: &App) {
     let t = &app.theme;
     let t_in = Tween::new(200, anim::Ease::OutCubic).t(app.now, app.help_at);
-    let w = screen.width.saturating_sub(6).min(44).max(24);
+    let w = screen.width.saturating_sub(4).min(46).max(24);
     let h = (KEYS.len() as u16 + 4).min(screen.height.saturating_sub(2));
     let x = screen.x + (screen.width.saturating_sub(w)) / 2;
     let y = screen.y + (screen.height.saturating_sub(h)) / 2 + ((1.0 - t_in) * 2.0) as u16;
