@@ -135,8 +135,11 @@ pub struct Theme {
     pub code_bg: Rgb,
     pub card_bg: Rgb,
     pub user_bg: Rgb,
+    #[allow(dead_code)]
     pub tool_pending_bg: Rgb,
+    #[allow(dead_code)]
     pub tool_success_bg: Rgb,
+    #[allow(dead_code)]
     pub tool_error_bg: Rgb,
     pub md_heading: Rgb,
     pub md_link: Rgb,
@@ -220,6 +223,19 @@ pub fn ramp(stops: &[Rgb], t: f32) -> Rgb {
 }
 
 fn to_256(rgb: Rgb) -> u8 {
+    let (r, g, b) = rgb;
+    let diff = (r as i32 - g as i32).abs().max((g as i32 - b as i32).abs()).max((r as i32 - b as i32).abs());
+    let lum = (r as u32 + g as u32 + b as u32) / 3;
+    // Map dark neutral / tinted-dark surface tones to the 232..255 grayscale ramp.
+    // Otherwise a dark surface like (30, 34, 44) rounds to cube coordinate 1,1,1
+    // which is index 59 (#5f5f5f, bright gray) and turns cards into light boxes.
+    if lum < 95 && diff <= 24 {
+        if lum < 8 {
+            return 16;
+        }
+        let step = (((lum - 8) as f32) / 10.0).round() as u8;
+        return 232 + step.min(23);
+    }
     // Nearest point in the 6x6x6 xterm cube.
     let q = |v: u8| -> u16 { (v as u16 * 5 + 127) / 255 };
     (16 + 36 * q(rgb.0) + 6 * q(rgb.1) + q(rgb.2)) as u8
@@ -261,10 +277,10 @@ mod tests {
     }
 
     #[test]
-    fn indexed_conversion_stays_in_cube() {
-        for rgb in [TEXT, ACCENT, RED, (0, 0, 0), (255, 255, 255)] {
+    fn indexed_conversion_stays_in_range() {
+        for rgb in [TEXT, ACCENT, RED, (0, 0, 0), (255, 255, 255), (30, 34, 44)] {
             let idx = to_256(rgb);
-            assert!((16..=231).contains(&idx), "{} not in cube", idx);
+            assert!((16..=255).contains(&idx), "{} not in valid range", idx);
         }
     }
 

@@ -141,6 +141,7 @@ impl Anim {
 }
 
 /// A short horizontal wobble, used to shake a card that failed.
+#[allow(dead_code)]
 pub fn shake(now: u64, at: u64, dur: u64) -> i8 {
     if now < at || now >= at + dur {
         return 0;

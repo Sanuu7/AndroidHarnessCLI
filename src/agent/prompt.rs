@@ -29,8 +29,7 @@ pub fn build(root: &Path, extra: &[String]) -> String {
          - Never invent file contents you have not read.\n\
          - When a tool fails, read the error and change your inputs instead of repeating the call.\n\
          - Text files end with a newline. Keep that when you edit.\n\
-         - This is a phone screen: answer in short lines and flat bullet lists under about 40 \
-         columns. No tables and no ASCII boxes.\n\
+         - Communicate naturally in clear, concise prose. Do NOT format everyday replies as bullet lists. Use bullet points only when listing items or options that genuinely warrant a list.\n\
          - If a decision is genuinely the user's, ask instead of guessing.\n",
     );
 
@@ -116,7 +115,7 @@ mod tests {
         assert!(text.contains("Android Harness"));
         assert!(text.contains(&dir.display().to_string()));
         assert!(text.contains("edit_file"));
-        assert!(text.contains("phone screen"), "the width rule matters");
+        assert!(text.contains("Communicate naturally"), "the prose rule matters");
     }
 
     #[test]

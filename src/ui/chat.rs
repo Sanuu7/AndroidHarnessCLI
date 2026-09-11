@@ -7,7 +7,7 @@
 use crate::anim::{self, Tween};
 use crate::app::{App, Item, ToolState};
 use crate::markdown;
-use crate::textutil::{pad_right, truncate, width, wrap};
+use crate::textutil::{truncate, width, wrap};
 use crate::theme::{self, Theme};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
@@ -572,24 +572,23 @@ fn tool_lines(
     let t = &app.theme;
     let now = app.now;
 
-    let (gutter_color, status, status_color) = match state {
+    let is_running = matches!(state, ToolState::Running { .. });
+    let (icon_glyph, icon_color, status, status_color) = match state {
         ToolState::Running { started } => {
-            // The spinner already sits in the icon slot, so this side shows
-            // only how long it has been going.
             let secs = now.saturating_sub(*started) as f32 / 1000.0;
             let s = if secs > 1.5 && w > 30 {
                 format!("{secs:.0}s")
             } else {
                 String::new()
             };
-            (t.amber, s, t.dim)
+            (anim::spinner(now), t.amber, s, t.dim)
         }
         ToolState::Done { ok, ms, at, .. } => {
             let mark = if *ok { "✓" } else { "✗" };
-            // The result flashes bright, then cools to its state color.
             let flash = 1.0 - (now.saturating_sub(*at) as f32 / 500.0).clamp(0.0, 1.0);
             let base = if *ok { t.green } else { t.red };
             (
+                mark,
                 base,
                 format!("{mark} {}", fmt_ms(*ms)),
                 theme::lerp(base, (255, 255, 255), flash * 0.8),
@@ -597,53 +596,36 @@ fn tool_lines(
         }
     };
 
-    // The card is tinted by what happened, the way pi colours its tool boxes.
-    let card = match state {
-        ToolState::Running { .. } => t.tool_pending_bg,
-        ToolState::Done { ok: true, .. } => t.tool_success_bg,
-        ToolState::Done { ok: false, .. } => t.tool_error_bg,
-    };
-    let body_bg = Some(t.c(theme::lerp(t.bg, card, 0.55 * alpha)));
-
-    // A failed card wobbles for a moment.
-    let jitter = match state {
-        ToolState::Done { ok: false, at, .. } => anim::shake(now, *at, 420).unsigned_abs() as usize,
-        _ => 0,
-    };
-
     let output: Option<&str> = match state {
         ToolState::Done { output, .. } => Some(output.as_str()),
         ToolState::Running { .. } => None,
     };
     let has_body = output.is_some_and(|o| !o.trim().is_empty());
-    let glyph = if expanded { "▾" } else { "▸" };
+    let toggle_glyph = if expanded { "▾ " } else { "▸ " };
 
     let status_w = width(&status);
-    let left_budget = w.saturating_sub(status_w + 3 + jitter);
+    let left_budget = w.saturating_sub(status_w + 3);
     let arg_line = tool_arg(name, args);
+
     let mut spans: Vec<Span> = Vec::new();
-    if jitter > 0 {
-        spans.push(Span::raw(" ".repeat(jitter)));
-    }
-    spans.push(Span::styled(
-        "▍".to_string(),
-        Style::default().fg(t.fade(gutter_color, alpha)),
-    ));
-    if matches!(state, ToolState::Running { .. }) {
-        // Spinner plus a present-tense verb, so the wait explains itself.
+    if is_running {
         spans.push(Span::styled(
-            format!("{} ", anim::spinner(now)),
-            Style::default().fg(t.fade(t.amber, alpha)),
+            format!("{icon_glyph} "),
+            Style::default().fg(t.fade(icon_color, alpha)),
         ));
     } else if has_body {
         spans.push(Span::styled(
-            format!("{glyph} "),
+            toggle_glyph.to_string(),
             Style::default().fg(t.fade(t.faint, alpha)),
         ));
     } else {
-        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("{icon_glyph} "),
+            Style::default().fg(t.fade(icon_color, alpha)),
+        ));
     }
-    let label = if matches!(state, ToolState::Running { .. }) {
+
+    let label = if is_running {
         format!("{} {name}", tool_gerund(name))
     } else {
         name.to_string()
@@ -654,36 +636,34 @@ fn tool_lines(
             .fg(t.fade(t.text, alpha))
             .add_modifier(Modifier::BOLD),
     ));
+
     let used: usize = spans.iter().map(|s| width(&s.content)).sum();
-    if left_budget > used + 5 {
+    if left_budget > used + 4 {
         let arg_budget = left_budget.saturating_sub(used + 3);
         spans.push(Span::styled(
             " · ".to_string(),
             Style::default().fg(t.fade(t.faint, alpha)),
         ));
-        // Arguments are shown as the one thing they are about: a phone row is
-        // not the place for a pretty printed JSON object.
         spans.push(Span::styled(
             truncate(&arg_line, arg_budget),
             Style::default().fg(t.fade(t.dim, alpha)),
         ));
     }
+
     let used: usize = spans.iter().map(|s| width(&s.content)).sum();
     let pad = w.saturating_sub(used + status_w + 1);
-    spans.push(Span::styled(" ".repeat(pad), Style::default().bg(body_bg.unwrap_or_default())));
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
     spans.push(Span::styled(
         status,
-        Style::default()
-            .fg(t.fade(status_color, alpha))
-            .bg(body_bg.unwrap_or_default()),
+        Style::default().fg(t.fade(status_color, alpha)),
     ));
     let mut out = vec![Line::from(spans)];
 
-    let inner_w = w.saturating_sub(CARD_INDENT + 2).max(4);
+    let inner_w = w.saturating_sub(CARD_INDENT).max(4);
     match (expanded, output) {
         (false, Some(text)) if has_body => {
-            // The first line that says something: tool output often starts
-            // with a heading or a blank.
             let mut shown = text
                 .trim()
                 .lines()
@@ -692,7 +672,7 @@ fn tool_lines(
                 .unwrap_or("")
                 .to_string();
             let more = text.trim().lines().filter(|l| !l.trim().is_empty()).count() > 1;
-            let budget = w.saturating_sub(CARD_INDENT + 2);
+            let budget = inner_w;
             shown = truncate(&shown, budget);
             if more && width(&shown) < budget {
                 shown.push_str(" …");
@@ -701,7 +681,7 @@ fn tool_lines(
                 Span::raw(" ".repeat(CARD_INDENT)),
                 Span::styled(
                     shown,
-                    Style::default().fg(t.fade(t.faint, alpha)).bg(body_bg.unwrap_or_default()),
+                    Style::default().fg(t.fade(t.faint, alpha)),
                 ),
             ]));
         }
@@ -712,7 +692,6 @@ fn tool_lines(
             let total = body.len();
             let shown = anim::reveal_lines(body.len().min(MAX_CARD_LINES), reveal);
             for line in body.iter().take(shown) {
-                // Diff lines carry their own colour: red out, green in.
                 let ink = match diff_kind(line) {
                     Some('+') => t.green,
                     Some('-') => t.red,
@@ -720,15 +699,12 @@ fn tool_lines(
                     None if line.trim() == "…" => t.faint,
                     None => t.dim,
                 };
-                for (i, row) in wrap(line, inner_w).into_iter().enumerate() {
-                    let lead = if i == 0 { CARD_INDENT } else { CARD_INDENT + 2 };
+                for row in wrap(line, inner_w).into_iter() {
                     out.push(Line::from(vec![
-                        Span::raw(" ".repeat(lead)),
+                        Span::raw(" ".repeat(CARD_INDENT)),
                         Span::styled(
-                            pad_right(&row, inner_w),
-                            Style::default()
-                                .fg(t.fade(ink, alpha))
-                                .bg(body_bg.unwrap_or_default()),
+                            row,
+                            Style::default().fg(t.fade(ink, alpha)),
                         ),
                     ]));
                 }

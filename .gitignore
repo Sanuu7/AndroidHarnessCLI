@@ -5,3 +5,4 @@ frames-*.txt
 .tmpws
 .tmphome
 /research
+.codegraph/
