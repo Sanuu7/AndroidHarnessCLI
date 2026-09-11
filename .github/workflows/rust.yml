@@ -21,10 +21,22 @@ jobs:
       run: |
         git config --global user.name "Harness CI"
         git config --global user.email "ci@androidharness.local"
-    - name: Build
+    - name: Build debug
       run: cargo build --verbose
     - name: Run tests
-      run: cargo test --verbose -- --nocapture
+      run: |
+        cargo test -- --nocapture > test.log 2>&1 || {
+          ERR=$(grep -C 4 -E "(FAILED|panicked at)" test.log | head -n 30 | tr '\n' '; ')
+          echo "::error title=Test Failure::$ERR"
+          exit 1
+        }
+    - name: Summarize failure
+      if: failure()
+      run: |
+        echo "### Cargo Test Failures" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        cat test.log >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
     - name: Upload debug binary
       uses: actions/upload-artifact@v4
       with:
