@@ -111,12 +111,14 @@ pub fn run_capture(ctx: &mut Ctx, command: &str, timeout_ms: u64) -> Result<Stri
         }
         if ctx.cancel.cancelled() {
             kill_group(pid);
+            let _ = child.kill();
             let _ = child.wait();
             let _ = fs::remove_file(&path);
             return Err("cancelled".into());
         }
         if started.elapsed() > Duration::from_millis(timeout_ms) {
             kill_group(pid);
+            let _ = child.kill();
             let _ = child.wait();
             let out = read_log(&path, 4_000);
             let _ = fs::remove_file(&path);
@@ -157,13 +159,23 @@ fn read_log(path: &PathBuf, cap: usize) -> String {
 }
 
 fn kill_group(pid: u32) {
-    // Negative pid: the whole process group, so children die with it.
-    let _ = Command::new("kill")
-        .arg("-TERM")
-        .arg(format!("-{pid}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    #[cfg(unix)]
+    unsafe {
+        let pgid = -(pid as i32);
+        libc::kill(pgid, libc::SIGTERM);
+        libc::kill(pid as i32, libc::SIGTERM);
+        libc::kill(pgid, libc::SIGKILL);
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("{pid}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 fn shell(ctx: &mut Ctx, args: &Value) -> Result<String, String> {
