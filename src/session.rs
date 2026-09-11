@@ -18,6 +18,7 @@ pub struct Session {
     pub updated: u64,
     pub model: String,
     pub provider: String,
+    pub workspace: PathBuf,
     pub messages: Vec<Msg>,
     /// Where it was saved, empty until the first save.
     pub path: PathBuf,
@@ -27,12 +28,13 @@ impl Session {
     pub fn new(model: &str, provider: &str) -> Self {
         let now = unix_now();
         Self {
-            id: format!("{now}"),
+            id: format!("{}-{}-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(), std::process::id(), next_id()),
             title: String::new(),
             created: now,
             updated: now,
             model: model.to_string(),
             provider: provider.to_string(),
+            workspace: std::env::current_dir().unwrap_or_default(),
             messages: Vec::new(),
             path: PathBuf::new(),
         }
@@ -68,6 +70,7 @@ impl Session {
             "updated": self.updated,
             "model": self.model,
             "provider": self.provider,
+            "workspace": self.workspace,
             "messages": self.messages.iter().map(message_json).collect::<Vec<_>>(),
         });
         let text = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
@@ -91,9 +94,37 @@ impl Session {
             updated: v.get("updated").and_then(|u| u.as_u64()).unwrap_or(0),
             model: v.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string(),
             provider: v.get("provider").and_then(|p| p.as_str()).unwrap_or("").to_string(),
+            workspace: v.get("workspace").and_then(|p| p.as_str()).unwrap_or("").into(),
             messages,
             path: path.clone(),
         })
+    }
+
+    pub fn matches_workspace(&self, root: &std::path::Path) -> bool {
+        self.workspace.as_os_str().is_empty() ||
+            self.workspace.canonicalize().unwrap_or_else(|_| self.workspace.clone()) ==
+            root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+    }
+
+    /// Complete the provider protocol without pretending an interrupted action succeeded.
+    pub fn repair_interrupted(&mut self) {
+        let old = std::mem::take(&mut self.messages);
+        let mut pending: Vec<ToolCall> = Vec::new();
+        for msg in old {
+            if !matches!(msg.role, Role::Tool) {
+                for call in pending.drain(..) {
+                    self.messages.push(Msg::tool(&call, "Interrupted before a result was saved. The outcome is unknown. Inspect current state before retrying; do not repeat completed operations.", true));
+                }
+            }
+            if matches!(msg.role, Role::Tool) {
+                pending.retain(|c| c.id != msg.call_id);
+            }
+            pending.extend(msg.calls.clone());
+            self.messages.push(msg);
+        }
+        for call in pending {
+            self.messages.push(Msg::tool(&call, "Interrupted before a result was saved. The outcome is unknown. Inspect current state before retrying; do not repeat completed operations.", true));
+        }
     }
 
     /// Most recently updated session, for `harness --continue`.
@@ -197,6 +228,11 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+fn next_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,4 +285,42 @@ mod tests {
         assert_eq!(Session::list().len(), 1);
         unsafe { std::env::remove_var("HARNESS_DATA_DIR") };
     }
+    #[test]
+    fn checkpoint_roundtrip_repairs_only_unknown_results() {
+        let dir = crate::tools::testutil::temp_dir("recovery");
+        let a = ToolCall { id: "a".into(), name: "write_file".into(), args: "{}".into() };
+        let b = ToolCall { id: "b".into(), name: "shell".into(), args: "{}".into() };
+        let mut session = Session::from_messages("model", "provider", vec![
+            Msg::user("do work"), Msg::assistant("", vec![a.clone(), b.clone()]), Msg::tool(&a, "saved", false)
+        ]);
+        session.path = dir.join("session.json");
+        session.workspace = dir.clone();
+        session.save().unwrap();
+        let mut restored = Session::load(&session.path).unwrap();
+        restored.repair_interrupted();
+        assert_eq!(restored.messages.len(), 4);
+        assert_eq!(restored.messages[2].text, "saved");
+        assert_eq!(restored.messages[3].call_id, "b");
+        assert!(restored.messages[3].error);
+        assert!(restored.messages[3].text.contains("unknown"));
+        restored.repair_interrupted();
+        assert_eq!(restored.messages.len(), 4, "recovery is idempotent");
+        assert!(restored.matches_workspace(&dir));
+        assert!(!restored.matches_workspace(&dir.join("other")));
+        assert_eq!(restored.provider, "provider");
+    }
+
+    #[test]
+    fn rapid_new_sessions_have_distinct_ids() {
+        assert_ne!(Session::new("m", "p").id, Session::new("m", "p").id);
+    }
+
+    #[test]
+    fn legacy_sessions_can_still_be_opened() {
+        let dir = crate::tools::testutil::temp_dir("legacy-session");
+        let path = dir.join("old.json");
+        fs::write(&path, r#"{"messages":[],"id":"old"}"#).unwrap();
+        assert!(Session::load(&path).unwrap().matches_workspace(&dir));
+    }
+
 }

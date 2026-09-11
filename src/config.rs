@@ -252,13 +252,25 @@ pub fn relay_provider() -> Provider {
 
 /// Write a file only the user can read. Keys live in here.
 pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
-    fs::write(path, text)?;
+    use std::io::Write;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = path.with_extension(format!("tmp-{}-{n}", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    Ok(())
+    let result = (|| {
+        let mut file = options.open(&temp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() { let _ = fs::remove_file(&temp); }
+    result
 }
 
 pub fn home() -> PathBuf {

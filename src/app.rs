@@ -227,6 +227,11 @@ pub struct Command {
 pub const COMMANDS: &[Command] = &[
     Command { name: "clear", args: "", desc: "forget this conversation" },
     Command { name: "compact", args: "", desc: "summarize older messages" },
+    Command { name: "context", args: "", desc: "context usage and compaction" },
+    Command { name: "memory", args: "[topic]", desc: "read saved notes" },
+    Command { name: "todos", args: "", desc: "show the task checklist" },
+    Command { name: "plan", args: "[on|off]", desc: "inspect and plan without edits" },
+    Command { name: "stop", args: "", desc: "stop the current task" },
     Command { name: "cost", args: "", desc: "spend for this session" },
     Command { name: "doctor", args: "", desc: "self-test the tools" },
     Command { name: "help", args: "", desc: "keys and commands" },
@@ -236,7 +241,7 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "provider", args: "[name]", desc: "switch or list providers" },
     Command { name: "quit", args: "", desc: "leave" },
     Command { name: "sessions", args: "[id]", desc: "resume a past session" },
-    Command { name: "skills", args: "", desc: "list installed skills" },
+    Command { name: "skills", args: "[name]", desc: "list installed skills" },
     Command { name: "theme", args: "", desc: "match your terminal" },
     Command { name: "thinking", args: "[level]", desc: "how hard the model thinks" },
 ];
@@ -411,6 +416,7 @@ pub struct App {
     pub input: Input,
     pub scroll: usize,
     pub busy: bool,
+    pub plan: bool,
     pub popup: Option<Popup>,
     pub help: bool,
     pub help_at: u64,
@@ -449,6 +455,7 @@ impl App {
             input: Input::new(),
             scroll: 0,
             busy: false,
+            plan: false,
             popup: None,
             help: false,
             help_at: 0,
@@ -992,6 +999,10 @@ impl App {
         if text.is_empty() {
             return;
         }
+        if self.busy && !matches!(text.as_str(), "/stop" | "/context" | "/cost" | "/todos" | "/help") {
+            self.note("task running; your draft is kept. Use ctrl+c or /stop to stop", false);
+            return;
+        }
         self.input.push_history(&text);
         self.input.clear();
         self.popup = None;
@@ -1019,6 +1030,10 @@ impl App {
         let mut parts = cmd.splitn(2, char::is_whitespace);
         let name = parts.next().unwrap_or("");
         let rest = parts.next().unwrap_or("").trim().to_string();
+        if self.busy && !matches!(name, "stop" | "context" | "cost" | "todos" | "help") {
+            self.note("stop the current task before changing its settings", false);
+            return;
+        }
         match name {
             "clear" => {
                 self.items.clear();
@@ -1038,7 +1053,34 @@ impl App {
                 self.help = true;
                 self.help_at = self.now;
             }
-            "cost" => {
+            "stop" => self.cancel_run(),
+            "plan" => {
+                let enabled = match rest.as_str() {
+                    "" => !self.plan,
+                    "on" => true,
+                    "off" => false,
+                    _ => { self.note("use /plan on or /plan off", true); return; }
+                };
+                self.plan = enabled;
+                if let Some(agent) = &self.agent { agent.plan(enabled); }
+                self.note(if enabled { "plan mode: inspect and propose; edits and shell disabled" } else { "build mode: tools can make changes" }, false);
+            }
+            "memory" => {
+                let args = if rest.is_empty() { "{}".to_string() } else {
+                    serde_json::json!({"topic": rest}).to_string()
+                };
+                self.spawn_tool("memory_read", &args);
+            }
+            "todos" => {
+                let root = std::env::current_dir().unwrap_or_default();
+                let todos = crate::tools::mem::read_todos(&root);
+                if todos.is_empty() { self.note("no tasks yet", false); }
+                for (text, status) in todos {
+                    let mark = match status.as_str() { "done" => "✓", "in_progress" => "›", _ => "○" };
+                    self.note(&format!("{mark} {text}"), false);
+                }
+            }
+            "cost" | "context" => {
                 let s = &self.status;
                 let cost = match s.cost {
                     Some(c) if c == 0.0 => "free".to_string(),
@@ -1053,6 +1095,7 @@ impl App {
                     s.ctx_max / 1000
                 );
                 self.note(&line, false);
+                if name == "context" { self.note("/compact summarizes older messages; automatic compaction starts at 72%", false); }
             }
             "compact" => {
                 if let Some(agent) = &self.agent {
@@ -1062,7 +1105,10 @@ impl App {
                 }
             }
             "doctor" => self.spawn_tool("doctor", "{\"network\":\"skip\"}"),
-            "skills" => self.spawn_tool("skills_list", "{}"),
+            "skills" => {
+                if rest.is_empty() { self.spawn_tool("skills_list", "{}"); }
+                else { self.spawn_tool("skill_view", &serde_json::json!({"name": rest}).to_string()); }
+            },
             "init" => self.write_agents_md(),
             "sessions" => {
                 if rest.is_empty() {
@@ -1241,10 +1287,34 @@ impl App {
             self.note("that session could not be read", true);
             return;
         };
-        let Some(agent) = &self.agent else {
+        if !session.matches_workspace(&std::env::current_dir().unwrap_or_default()) {
+            self.note(&format!("open {} to resume this session", session.workspace.display()), true);
+            return;
+        }
+        if self.agent.is_none() {
             self.note("no engine attached", true);
             return;
         };
+        self.restore_messages(&session);
+        if let Some(provider) = self.config.as_ref().and_then(|cfg| cfg.find(&session.provider)).cloned() {
+            if let Some(agent) = &mut self.agent { agent.swap(provider.clone(), session.model.clone()); }
+            self.status.provider = provider.name;
+            self.status.model = session.model.clone();
+            self.status.ctx_max = crate::agent::default_ctx_max(&session.model);
+        } else {
+            self.note("saved provider unavailable; keeping the current provider", false);
+        }
+        let title = session.title.clone();
+        let messages = session.messages.len();
+        let model = session.model.clone();
+        if let Some(agent) = &self.agent { agent.load(session); }
+        self.note(&format!("resumed {title} ({messages} messages)"), false);
+        if !model.is_empty() && model != self.status.model {
+            self.note(&format!("that session used {model}"), false);
+        }
+    }
+
+    pub(crate) fn restore_messages(&mut self, session: &crate::session::Session) {
         self.items.clear();
         for msg in &session.messages {
             match msg.role {
@@ -1273,18 +1343,10 @@ impl App {
                 }),
             }
         }
-        let title = session.title.clone();
-        let messages = session.messages.len();
-        let model = session.model.clone();
-        agent.load(session);
-        self.note(&format!("resumed {title} ({messages} messages)"), false);
-        if !model.is_empty() && model != self.status.model {
-            self.note(&format!("that session used {model}"), false);
-        }
     }
 
     /// Run a tool from the UI, showing it in the transcript like any other.
-    fn spawn_tool(&mut self, name: &str, args: &'static str) {
+    fn spawn_tool(&mut self, name: &str, args: &str) {
         if self.local.is_some() {
             self.note("a local check is already running", false);
             return;
@@ -1292,11 +1354,12 @@ impl App {
         let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
         let (tx, rx) = std::sync::mpsc::channel();
         let name = name.to_string();
+        let args = args.to_string();
         std::thread::spawn(move || {
             let mut ctx = crate::tools::Ctx::new(root, crate::llm::http::Cancel::new(), "ui".into());
             let _ = tx.send(AgentEvent::ToolStart { name: name.clone(), args: args.to_string() });
             let started = std::time::Instant::now();
-            let result = crate::tools::run(&mut ctx, &name, args);
+            let result = crate::tools::run(&mut ctx, &name, &args);
             let ms = started.elapsed().as_millis() as u64;
             let (ok, output) = match result {
                 Ok(text) => (true, crate::tools::clip(text)),
@@ -1597,8 +1660,8 @@ mod tests {
     fn command_palette_still_filters_commands() {
         let popup = Popup::commands("mo".into(), 0);
         let names: Vec<&str> = popup.commands_matching().iter().map(|c| c.name).collect();
-        assert_eq!(names, vec!["model"]);
-        assert_eq!(popup.rows(), 1);
+        assert_eq!(names, vec!["memory", "model"]);
+        assert_eq!(popup.rows(), 2);
     }
 
     #[test]

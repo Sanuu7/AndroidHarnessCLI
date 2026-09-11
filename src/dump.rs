@@ -431,3 +431,19 @@ fn color_sgr(color: Color, bg: bool) -> String {
         Color::Reset => "39".to_string(),
     }
 }
+
+#[cfg(test)]
+mod phone_tests {
+    use super::*;
+    #[test]
+    fn every_screen_fits_phone_and_keyboard_sizes() {
+        for (w, h) in [(20, 8), (32, 12), (36, 24), (42, 20), (60, 30)] {
+            for state in STATES {
+                let app = build(state, ColorLevel::True, 5000);
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| app.draw(f)).unwrap();
+                assert_eq!(term.backend().buffer().area.width, w);
+            }
+        }
+    }
+}

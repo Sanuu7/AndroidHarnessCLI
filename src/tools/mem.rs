@@ -67,6 +67,13 @@ pub fn tools() -> Vec<Tool> {
         read_only: false,
     },
     Tool {
+        name: "skill_manage",
+        desc: "Create or update a workspace skill. Existing skills require overwrite=true. Use only when the user requests a reusable skill.",
+        params: schema(json!({"name": string_prop("Letters, digits, hyphens or underscores; max 64 characters"), "content": string_prop("Full SKILL.md contents"), "overwrite": bool_prop("Explicitly replace an existing skill")}), &["name", "content"]),
+        run: skill_manage,
+        read_only: false,
+    },
+    Tool {
         name: "skills_list",
         desc: "List installed skills with their descriptions.",
         params: schema(json!({}), &[]),
@@ -76,7 +83,7 @@ pub fn tools() -> Vec<Tool> {
     Tool {
         name: "skill_view",
         desc: "Read a skill's full instructions before following them.",
-        params: schema(json!({ "name": string_prop("Skill name") }), &["name"]),
+        params: schema(json!({ "name": string_prop("Skill name"), "file_path": string_prop("Optional supporting file inside the skill folder") }), &["name"]),
         run: skill_view,
         read_only: true,
     },
@@ -94,6 +101,10 @@ fn topics_dir(ctx: &Ctx) -> PathBuf {
 }
 
 fn memory_read(ctx: &mut Ctx, args: &Value) -> Result<String, String> {
+    if str_arg(args, "topic").is_none() {
+        let core = fs::read_to_string(notes_path(ctx)).unwrap_or_else(|_| "(empty)".into());
+        return Ok(super::clip(format!("{core}\n\nTopics: {}", memory_topics(&ctx.root).join(", "))));
+    }
     let path = match str_arg(args, "topic") {
         Some(topic) => topics_dir(ctx).join(format!("{}.md", sanitize(&topic))),
         None => notes_path(ctx),
@@ -103,6 +114,17 @@ fn memory_read(ctx: &mut Ctx, args: &Value) -> Result<String, String> {
         Ok(_) => Ok(format!("{} is empty", ctx.display(&path))),
         Err(_) => Ok(format!("nothing stored yet ({})", ctx.display(&path))),
     }
+}
+
+pub fn memory_topics(root: &Path) -> Vec<String> {
+    let mut topics: Vec<String> = fs::read_dir(root.join(DIR).join("memory"))
+        .into_iter().flatten().flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "md"))
+        .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .collect();
+    topics.sort();
+    topics
 }
 
 fn sanitize(name: &str) -> String {
@@ -234,7 +256,9 @@ pub fn list_skills(ctx: &Ctx) -> Vec<(String, String, PathBuf)> {
                 .file_stem()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "skill".into());
-            out.push((name, describe(&text), file));
+            if !out.iter().any(|(n, _, _): &(String, String, PathBuf)| n.eq_ignore_ascii_case(&name)) {
+                out.push((name, describe(&text), file));
+            }
         }
     }
     out.sort();
@@ -267,6 +291,33 @@ pub fn describe(text: &str) -> String {
         .unwrap_or_else(|| "no description".into())
 }
 
+fn skill_manage(ctx: &mut Ctx, args: &Value) -> Result<String, String> {
+    let name = str_req(args, "name")?;
+    if name.len() > 64 || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("invalid skill name".into());
+    }
+    let content = str_req(args, "content")?;
+    let base = ctx.root.join(DIR).join("skills");
+    let canonical_root = ctx.root.canonicalize().map_err(|e| e.to_string())?;
+    let mut ancestor = base.as_path();
+    while !ancestor.exists() {
+        ancestor = ancestor.parent().ok_or("invalid skills folder")?;
+    }
+    if !ancestor.canonicalize().map_err(|e| e.to_string())?.starts_with(&canonical_root) {
+        return Err("skills folder escapes the workspace".into());
+    }
+    fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+    let base = base.canonicalize().map_err(|e| e.to_string())?;
+    if !base.starts_with(&canonical_root) { return Err("skills folder escapes the workspace".into()); }
+    let dir = base.join(&name);
+    if dir.is_symlink() { return Err("skill folder cannot be a symlink".into()); }
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("SKILL.md");
+    if path.exists() && !bool_arg(args, "overwrite") { return Err("skill exists; use overwrite=true to replace it".into()); }
+    crate::config::write_private(&path, &format!("{}\n", content.trim_end())).map_err(|e| e.to_string())?;
+    Ok(format!("saved workspace skill {name}"))
+}
+
 fn skills_list(ctx: &mut Ctx, _args: &Value) -> Result<String, String> {
     let skills = list_skills(ctx);
     if skills.is_empty() {
@@ -293,6 +344,14 @@ fn skill_view(ctx: &mut Ctx, args: &Value) -> Result<String, String> {
         let names: Vec<String> = skills.into_iter().map(|(n, _, _)| n).collect();
         return Err(format!("no skill '{want}'. installed: {}", names.join(", ")));
     };
+    let path = if let Some(file) = str_arg(args, "file_path").filter(|s| !s.is_empty()) {
+        let base = path.parent().ok_or("skill has no folder")?.canonicalize().map_err(|e| e.to_string())?;
+        let target = base.join(file).canonicalize().map_err(|e| e.to_string())?;
+        if !target.starts_with(&base) {
+            return Err("supporting files must stay inside the skill folder".into());
+        }
+        target
+    } else { path };
     let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     Ok(super::clip(text))
 }
@@ -403,4 +462,33 @@ mod tests {
         assert_eq!(describe("# Title\nbody"), "Title");
         assert_eq!(describe("first line\n"), "first line");
     }
+    #[test]
+    fn skill_management_and_support_files() {
+        let dir = temp_dir("skill-manage");
+        let mut ctx = ctx_in(&dir);
+        let args = json!({"name":"example", "content":"# Example\nFollow these rules."});
+        skill_manage(&mut ctx, &args).unwrap();
+        assert!(skill_manage(&mut ctx, &args).is_err());
+        assert!(skill_manage(&mut ctx, &json!({"name":"../escape", "content":"no"})).is_err());
+        let refs = dir.join(".harness/skills/example/references");
+        fs::create_dir_all(&refs).unwrap();
+        fs::write(refs.join("guide.md"), "support instructions").unwrap();
+        let text = skill_view(&mut ctx, &json!({"name":"example", "file_path":"references/guide.md"})).unwrap();
+        assert_eq!(text, "support instructions");
+        fs::write(dir.join("outside.md"), "outside").unwrap();
+        assert!(skill_view(&mut ctx, &json!({"name":"example", "file_path":"../../../outside.md"})).is_err());
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink(dir.join("outside.md"), refs.join("escape.md")).unwrap();
+            assert!(skill_view(&mut ctx, &json!({"name":"example", "file_path":"references/escape.md"})).is_err());
+        }
+    }
+
+    #[test]
+    fn core_read_lists_available_topics() {
+        let dir = temp_dir("topic-index");
+        let mut ctx = ctx_in(&dir);
+        memory_write(&mut ctx, &json!({"topic":"build", "content":"cargo test"})).unwrap();
+        assert!(memory_read(&mut ctx, &json!({})).unwrap().contains("build"));
+    }
+
 }

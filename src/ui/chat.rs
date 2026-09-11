@@ -139,13 +139,15 @@ fn welcome(frame: &mut Frame, area: Rect, app: &App) {
     );
 
     let hints = [
-        "ask about this repo",
-        "/doctor runs the self test",
-        "/help lists the keys",
+        "/plan  explore before editing",
+        "/sessions  pick up past work",
+        "/help  keys and commands",
     ];
     let mut lines: Vec<Line> = vec![
         Line::from(diamond).alignment(Alignment::Center),
         Line::from(word).alignment(Alignment::Center),
+        Line::default(),
+        Line::from(Span::styled(truncate(&app.status.workspace, area.width.saturating_sub(4) as usize), Style::default().fg(t.c(t.dim)))).alignment(Alignment::Center),
         Line::default(),
     ];
     for (i, hint) in hints.iter().enumerate() {
@@ -980,7 +982,7 @@ mod tests {
         let app = app_with(vec![]);
         let out = render(&app, 44, 16);
         assert!(out.contains("harness"));
-        assert!(out.contains("/doctor"));
+        assert!(out.contains("/plan"));
     }
 
     #[test]

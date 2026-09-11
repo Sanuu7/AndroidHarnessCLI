@@ -67,7 +67,7 @@ fn main() -> io::Result<()> {
             }
             "--continue" | "-c" => {
                 options.resume = Some(args.get(i + 1).filter(|a| !a.starts_with('-')).cloned());
-                if options.resume.is_some() {
+                if matches!(options.resume, Some(Some(_))) {
                     i += 1;
                 }
             }
@@ -128,7 +128,7 @@ keys:
   ctrl+c     cancel, twice to quit      ctrl+d  quit now
 
 commands: /model /provider /thinking /sessions /new /clear /compact /cost
-          /doctor /init /skills /theme /help /quit
+          /doctor /init /skills /memory /todos /context /plan /stop /theme /help /quit
 
 env:
   HARNESS_API_KEY=...         key for the active provider
@@ -185,6 +185,18 @@ fn build_agent(app: &mut App, options: &Options) -> Option<(Agent, config::Confi
     if let Some(model) = &options.model {
         cfg.model = model.clone();
     }
+    let saved = resume(&cfg, options).filter(|(session, _)| {
+        let valid = session.matches_workspace(&std::env::current_dir().unwrap_or_default());
+        if !valid { app.note(&format!("open {} to resume this session", session.workspace.display()), true); }
+        valid
+    });
+    if let Some((session, _)) = &saved {
+        if options.provider.is_none() && cfg.find(&session.provider).is_some() {
+            cfg.provider = session.provider.clone();
+        }
+        if options.model.is_none() && cfg.provider == session.provider && !session.model.is_empty() { cfg.model = session.model.clone(); }
+    }
+    if let Some(level) = options.thinking.as_deref().and_then(llm::Level::parse) { cfg.thinking = level; }
     let provider = cfg.active().clone();
     if provider.kind != config::Kind::Relay && provider.api_key.is_empty() {
         app.note(
@@ -207,8 +219,9 @@ fn build_agent(app: &mut App, options: &Options) -> Option<(Agent, config::Confi
     let ctx_max = agent::default_ctx_max(&cfg.model);
     let agent = Agent::start(provider, cfg.model.clone(), root, ctx_max, cfg.thinking, app.prefs.clone());
 
-    match resume(&cfg, options) {
+    match saved {
         Some((session, from_args)) => {
+            app.restore_messages(&session);
             let messages = session.messages.len();
             let title = session.title.clone();
             let model = session.model.clone();

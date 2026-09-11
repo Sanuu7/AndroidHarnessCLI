@@ -51,6 +51,13 @@ pub enum AgentEvent {
     Cancelled,
 }
 
+fn plan_tool_allowed(name: &str) -> bool {
+    matches!(name, "read_file" | "list_dir" | "file_info" | "search_files" | "grep"
+        | "memory_read" | "memory_search" | "skills_list" | "skill_view"
+        | "git_status" | "git_diff" | "git_log" | "git_show" | "git_branch"
+        | "web_search" | "web_fetch")
+}
+
 enum Cmd {
     Say(String),
     Cancel,
@@ -58,6 +65,7 @@ enum Cmd {
     Compact,
     Swap { provider: Box<Provider>, model: String },
     SetThinking(Level),
+    Plan(bool),
     Load(Box<Session>),
     Shutdown,
 }
@@ -107,6 +115,7 @@ impl Agent {
                 ctx_max,
                 level,
                 prefs,
+                plan: false,
             };
             worker.run(rx);
         });
@@ -144,9 +153,14 @@ impl Agent {
         let _ = self.tx.send(Cmd::Load(Box::new(session)));
     }
 
+    pub fn plan(&self, enabled: bool) {
+        let _ = self.tx.send(Cmd::Plan(enabled));
+    }
+
     pub fn swap(&mut self, provider: Provider, model: String) {
         self.provider = provider.name.clone();
         self.model = model.clone();
+        self.ctx_max = default_ctx_max(&model);
         let _ = self.tx.send(Cmd::Swap { provider: Box::new(provider), model });
     }
 
@@ -196,6 +210,7 @@ struct Worker {
     /// How hard to think, sent on every request.
     level: Level,
     prefs: Vec<String>,
+    plan: bool,
 }
 
 fn emit(tx: &Sender<AgentEvent>, event: AgentEvent) {
@@ -207,17 +222,21 @@ impl Worker {
         while let Ok(cmd) = rx.recv() {
             match cmd {
                 Cmd::Say(text) => {
+                    self.session.messages = self.messages.clone();
+                    self.session.repair_interrupted();
+                    self.messages = self.session.messages.clone();
                     self.messages.push(Msg::user(text));
                     self.turn();
                 }
                 Cmd::Cancel => {}
+                Cmd::Plan(enabled) => { self.plan = enabled; }
                 Cmd::Compact => {
                     if self.compact_now() {
                         emit(&self.tx, AgentEvent::Notice("context compacted".into()));
                     } else {
                         emit(&self.tx, AgentEvent::Notice("nothing to compact".into()));
                     }
-                    emit(&self.tx, AgentEvent::Done);
+                    self.finish();
                 }
                 Cmd::New => {
                     self.messages.clear();
@@ -230,6 +249,7 @@ impl Worker {
                 Cmd::Swap { provider, model } => {
                     self.provider = *provider;
                     self.model = model;
+                    self.ctx_max = default_ctx_max(&self.model);
                     self.session.model = self.model.clone();
                     self.session.provider = self.provider.name.clone();
                     emit(&self.tx, AgentEvent::Done);
@@ -238,7 +258,13 @@ impl Worker {
                     self.level = level;
                     emit(&self.tx, AgentEvent::Done);
                 }
-                Cmd::Load(session) => {
+                Cmd::Load(mut session) => {
+                    if !session.matches_workspace(&self.root) {
+                        emit(&self.tx, AgentEvent::Notice(format!("Session belongs to {}. Open that workspace to resume it.", session.workspace.display())));
+                        emit(&self.tx, AgentEvent::Done);
+                        continue;
+                    }
+                    session.repair_interrupted();
                     self.messages = session.messages.clone();
                     self.session = *session;
                     emit(&self.tx, AgentEvent::Done);
@@ -252,6 +278,7 @@ impl Worker {
 
     fn turn(&mut self) {
         self.cancel.reset();
+        if !self.checkpoint() { self.finish(); return; }
         let mut step = 0usize;
         while step < MAX_STEPS {
             step += 1;
@@ -286,6 +313,7 @@ impl Worker {
                 );
             }
             self.messages.push(Msg::assistant(result.text, result.calls.clone()));
+            if !self.checkpoint() { self.finish(); return; }
             if result.calls.is_empty() {
                 break;
             }
@@ -319,9 +347,22 @@ impl Worker {
             return Ok(());
         }
         self.session.messages = self.messages.clone();
+        self.session.workspace = self.root.clone();
+        self.session.model = self.model.clone();
+        self.session.provider = self.provider.name.clone();
         let path = self.session.save()?;
         emit(&self.tx, AgentEvent::Session(path.display().to_string()));
         Ok(())
+    }
+
+    fn checkpoint(&mut self) -> bool {
+        match self.session_save() {
+            Ok(()) => true,
+            Err(e) => {
+                emit(&self.tx, AgentEvent::Error(format!("Could not save progress: {e}")));
+                false
+            }
+        }
     }
 
     /// Run the calls from one assistant turn. Read-only neighbours in the
@@ -334,7 +375,7 @@ impl Worker {
                 return false;
             }
             let mut batch: Vec<&ToolCall> = Vec::new();
-            let parallel_ok = tools::find(&calls[idx].name).map(|t| t.read_only).unwrap_or(false);
+            let parallel_ok = !self.plan && tools::find(&calls[idx].name).map(|t| t.read_only).unwrap_or(false);
             if parallel_ok {
                 while idx < calls.len() && batch.len() < 4 {
                     match tools::find(&calls[idx].name) {
@@ -357,11 +398,15 @@ impl Worker {
             for (call, (ok, output)) in batch.iter().zip(results) {
                 self.messages.push(Msg::tool(call, output, !ok));
             }
+            if !self.checkpoint() { return false; }
         }
         true
     }
 
     fn run_one(&self, call: &ToolCall) -> (bool, String) {
+        if self.plan && !plan_tool_allowed(&call.name) {
+            return (false, "Plan mode: this tool is disabled. Describe the proposed changes; the user can use /plan off to enable execution.".into());
+        }
         let mut ctx = tools::Ctx::new(
             self.root.clone(),
             self.cancel.clone(),
@@ -469,8 +514,11 @@ impl Worker {
     }
 
     fn stream_turn(&mut self) -> Result<TurnResult, StreamError> {
-        let system = prompt::build(&self.root, &self.prefs);
-        let schemas = tools::schemas();
+        let mut system = prompt::build(&self.root, &self.prefs);
+        if self.plan {
+            system.push_str("\nPlan mode is enabled. Inspect using the available read tools and propose a concrete plan. Do not make changes or execute commands. Wait for the user to switch /plan off.\n");
+        }
+        let schemas: Vec<_> = tools::schemas().into_iter().filter(|t| !self.plan || plan_tool_allowed(&t.name)).collect();
         // Thinking is paid for out of the same budget as the answer, so the
         // ceiling grows with it instead of squeezing the reply.
         let thinking = llm::Thinking::new(self.level, ANSWER_TOKENS + self.level.budget());
@@ -835,5 +883,34 @@ mod tests {
         assert_eq!(agent.model, "test-model");
         assert!(agent.poll().is_empty());
         drop(agent);
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    #[test]
+    fn planning_excludes_commands_and_mutations() {
+        let root = crate::tools::testutil::temp_dir("plan-execution");
+        let (tx, _rx) = channel();
+        let worker = Worker {
+            provider: crate::config::relay_provider(), model: "test".into(), root: root.clone(),
+            messages: vec![], session: Session::new("test", "harness"), tx,
+            cancel: http::Cancel::new(), session_in: 0, session_out: 0,
+            cache_read: 0, cache_write: 0, cost: None, ctx_max: 128_000,
+            level: Level::Medium, prefs: vec![], plan: true,
+        };
+        let call = ToolCall { id: "blocked".into(), name: "write_file".into(),
+            args: r#"{"path":"should-not-exist","content":"blocked"}"#.into() };
+        let result = worker.run_one(&call);
+        assert!(!result.0);
+        assert!(result.1.contains("Plan mode"));
+        assert!(!root.join("should-not-exist").exists());
+        for name in ["shell", "shell_background", "write_file", "http_request", "skill_manage", "memory_write", "git_commit", "invented"] {
+            assert!(!plan_tool_allowed(name), "{name}");
+        }
+        for name in ["read_file", "grep", "skill_view", "memory_read", "git_diff"] {
+            assert!(plan_tool_allowed(name), "{name}");
+        }
     }
 }

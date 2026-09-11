@@ -28,7 +28,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     constraints.push(Constraint::Min(3));
     constraints.push(Constraint::Length(1));
     constraints.push(Constraint::Length(input_h));
-    constraints.push(Constraint::Length(1));
+    constraints.push(Constraint::Length(if area.width < WIDE && area.height >= 12 { 2 } else { 1 }));
     let chunks = Layout::vertical(constraints).split(area);
 
     let mut i = 0;

@@ -53,6 +53,13 @@ pub fn build(root: &Path, extra: &[String]) -> String {
         "prompt".into(),
     );
     let catalog = mem::catalog(&ctx_root);
+    let topics = mem::memory_topics(root);
+    if !topics.is_empty() {
+        out.push_str(&format!("\n# Memory topics\n{}\nUse memory_search to find relevant notes, then memory_read(topic=...) to read them.\n", topics.join(", ")));
+    }
+    if root.join(".codegraph").is_dir() {
+        out.push_str("\n# CodeGraph\nThis project has a CodeGraph index. Before grep or reading source, use shell to run codegraph explore with a focused symbol or question. Do not re-index automatically. If unavailable, fall back to file tools.\n");
+    }
     if !catalog.is_empty() {
         out.push_str("\n# Skills\n");
         out.push_str(&catalog);
@@ -146,4 +153,15 @@ mod tests {
         let text = build(&dir, &["no em-dashes".to_string()]);
         assert!(text.contains("- no em-dashes"));
     }
+    #[test]
+    fn indexed_projects_and_memory_topics_are_discoverable() {
+        let dir = temp_dir("prompt-index");
+        fs::create_dir_all(dir.join(".codegraph")).unwrap();
+        fs::create_dir_all(dir.join(".harness/memory")).unwrap();
+        fs::write(dir.join(".harness/memory/build.md"), "instructions").unwrap();
+        let text = build(&dir, &[]);
+        assert!(text.contains("codegraph explore"));
+        assert!(text.contains("# Memory topics\nbuild"));
+    }
+
 }

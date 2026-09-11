@@ -109,7 +109,11 @@ pub fn separator(frame: &mut Frame, area: Rect, app: &App) {
 pub fn input(frame: &mut Frame, area: Rect, app: &App, iv: &InputView) {
     if app.input.is_empty() {
         let t = &app.theme;
-        let placeholder = if area.width >= MID {
+        let placeholder = if app.busy {
+            "draft your next message…"
+        } else if app.plan {
+            "what should we plan?"
+        } else if area.width >= MID {
             "ask anything  ·  / for commands"
         } else {
             "ask anything"
@@ -134,6 +138,25 @@ pub fn status(frame: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
     let w = area.width as usize;
     let s = &app.status;
+    if area.height >= 2 {
+        let mode = if app.plan { "plan" } else { "build" };
+        let state = if app.busy { "working · /stop" } else { mode };
+        let suffix = format!(" {}", s.thinking.as_str());
+        let model = truncate(&s.model, w.saturating_sub(width(&suffix) + 1));
+        let pct = s.ctx_pct(app.now);
+        let cost = s.cost.map(|_| fmt_cost(s.disp_cost(app.now), true)).unwrap_or_else(|| "n/a".into());
+        let stats = format!("{pct}% · {cost}");
+        let label = truncate(state, w.saturating_sub(width(&stats) + 1));
+        let gap = w.saturating_sub(width(&label) + width(&stats));
+        let ink = if pct > 90 { t.red } else if pct > 70 { t.amber } else { t.dim };
+        frame.render_widget(Paragraph::new(vec![
+            Line::from(vec![Span::styled(model, Style::default().fg(t.c(t.dim))),
+                Span::styled(suffix, Style::default().fg(t.c(theme::thinking_color(s.thinking))))]),
+            Line::from(vec![Span::styled(label, Style::default().fg(t.c(t.accent))),
+                Span::raw(" ".repeat(gap)), Span::styled(stats, Style::default().fg(t.c(ink)))])
+        ]), area);
+        return;
+    }
     let now = app.now;
 
     let mut left: Vec<Span> = Vec::new();
@@ -237,7 +260,8 @@ pub fn status(frame: &mut Frame, area: Rect, app: &App) {
     // part that gives way; the thinking level is one word and stays.
     if left_w + right_w + 1 > w {
         if let Some(model) = left.get_mut(1) {
-            let room = w.saturating_sub(right_w + 2);
+            let other = left_w.saturating_sub(width(&model.content));
+            let room = w.saturating_sub(right_w + other + 1);
             let text = truncate(&model.content, room);
             model.content = text.into();
             left_w = left.iter().map(|s| width(&s.content)).sum();
