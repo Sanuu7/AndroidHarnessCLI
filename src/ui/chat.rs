@@ -45,10 +45,13 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     // Where the last thing the user said starts, so the fade mask above never
     // dims the turn being read.
     let mut last_user_row = 0usize;
+    let mut prev_is_tool = false;
     for item in app.items.iter() {
-        if !lines.is_empty() {
+        let is_tool = matches!(item, Item::Tool { .. });
+        if !lines.is_empty() && !(prev_is_tool && is_tool) {
             lines.push(Line::default());
         }
+        prev_is_tool = is_tool;
         if matches!(item, Item::User { .. }) {
             last_user_row = lines.len();
         }
@@ -202,7 +205,9 @@ fn item_lines(item: &Item, app: &App, w: usize, scale: f32) -> Vec<Line<'static>
 /// Reasoning is not the answer: while it streams it shows the tail with a
 /// spinner header, and once the answer starts it collapses to one line that
 /// says how long it thought. ctrl+t opens it again (pi's thinking toggle,
-/// opencode's "Thought · 12s" line).
+/// Reasoning is not the answer: while it streams it shows a single quiet line
+/// with a spinner, and once finished it shows how long it thought.
+/// ctrl+t opens it to read the thought process in clean italic dim text.
 fn reasoning_lines(
     app: &App,
     text: &str,
@@ -214,91 +219,113 @@ fn reasoning_lines(
     let t = &app.theme;
     let ink = theme::thinking_color(app.status.thinking);
     let open = app.thinking_open || app.expand;
-    if finished > 0 && !open {
-        let secs = (finished.saturating_sub(born)) as f32 / 1000.0;
-        let mut spans = vec![
-            Span::raw(" ".repeat(BODY_INDENT)),
-            Span::styled("│ ".to_string(), Style::default().fg(t.fade(ink, alpha * 0.5))),
-            Span::styled(
-                "Thought".to_string(),
+
+    if !open {
+        let mut spans = Vec::new();
+        if finished > 0 {
+            let secs = (finished.saturating_sub(born)) as f32 / 1000.0;
+            spans.push(Span::styled(
+                "· ".to_string(),
+                Style::default().fg(t.fade(ink, alpha * 0.6)),
+            ));
+            spans.push(Span::styled(
+                if secs >= 1.0 {
+                    format!("Thought for {secs:.0}s")
+                } else {
+                    "Thought".to_string()
+                },
                 Style::default()
                     .fg(t.fade(ink, alpha * 0.9))
                     .add_modifier(Modifier::ITALIC),
-            ),
-        ];
-        if secs >= 1.0 {
-            spans.push(Span::styled(
-                format!(" · {secs:.0}s"),
-                Style::default().fg(t.fade(t.faint, alpha * 0.9)),
             ));
+        } else {
+            let secs = (app.now.saturating_sub(born)) as f32 / 1000.0;
+            spans.push(Span::styled(
+                format!("{} ", anim::spinner(app.now)),
+                Style::default().fg(t.fade(t.amber, alpha)),
+            ));
+            spans.push(Span::styled(
+                "Thinking...".to_string(),
+                Style::default()
+                    .fg(t.fade(ink, alpha))
+                    .add_modifier(Modifier::ITALIC),
+            ));
+            if secs >= 1.0 {
+                spans.push(Span::styled(
+                    format!(" ({secs:.1}s)"),
+                    Style::default().fg(t.fade(t.faint, alpha * 0.8)),
+                ));
+            }
         }
-        if !app.status.thinking.is_off() {
+        if !app.status.thinking.is_off() && w > 36 {
             spans.push(Span::styled(
                 format!(" · {}", app.status.thinking.as_str()),
-                Style::default().fg(t.fade(ink, alpha * 0.7)),
+                Style::default().fg(t.fade(t.faint, alpha * 0.7)),
             ));
         }
         return vec![Line::from(spans)];
     }
 
+    // Expanded view (toggled via ctrl+t)
     let mut out: Vec<Line<'static>> = Vec::new();
-    let header = if finished > 0 {
-        // Open, and no longer arriving: a plain label.
-        Line::from(vec![
-            Span::raw(" ".repeat(BODY_INDENT)),
-            Span::styled(
-                "Thought".to_string(),
-                Style::default()
-                    .fg(t.fade(ink, alpha * 0.9))
-                    .add_modifier(Modifier::ITALIC),
-            ),
-        ])
+    let secs = if finished > 0 {
+        (finished.saturating_sub(born)) as f32 / 1000.0
     } else {
-        Line::from(vec![
-            Span::raw(" ".repeat(BODY_INDENT)),
-            Span::styled(
-                format!("{} ", anim::spinner(app.now)),
-                Style::default().fg(t.fade(t.amber, alpha)),
-            ),
-            Span::styled(
-                "Thinking".to_string(),
-                Style::default().fg(t.fade(ink, alpha)),
-            ),
-        ])
+        (app.now.saturating_sub(born)) as f32 / 1000.0
     };
-    out.push(header);
-
-    let budget = w.saturating_sub(BODY_INDENT + 2).max(8);
-    let flat = text.replace('\n', " ");
-    let rows = wrap(&flat, budget);
-    let shown = if open { rows.len() } else { rows.len().min(3) };
-    let start = rows.len().saturating_sub(shown);
-    // A breathing gutter marks the stream while it is still arriving.
-    let pulse = anim::breathe(app.now, 1100);
-    let color = theme::lerp(ink, t.accent2, pulse * 0.25);
-    for row in rows[start..].iter() {
-        out.push(Line::from(vec![
-            Span::raw(" ".repeat(BODY_INDENT)),
-            Span::styled(
-                "│ ".to_string(),
-                Style::default().fg(t.fade(color, alpha * 0.7)),
-            ),
-            Span::styled(
-                row.clone(),
-                Style::default()
-                    .fg(t.fade(t.faint, alpha * 0.9))
-                    .add_modifier(Modifier::ITALIC),
-            ),
-        ]));
+    let mut header_spans = vec![
+        Span::styled(
+            if finished > 0 { "▾ " } else { "⠋ " },
+            Style::default().fg(t.fade(if finished > 0 { ink } else { t.amber }, alpha)),
+        ),
+        Span::styled(
+            if finished > 0 {
+                if secs >= 1.0 {
+                    format!("Thought for {secs:.0}s")
+                } else {
+                    "Thought".to_string()
+                }
+            } else {
+                "Thinking...".to_string()
+            },
+            Style::default()
+                .fg(t.fade(ink, alpha))
+                .add_modifier(Modifier::ITALIC),
+        ),
+    ];
+    if finished == 0 && secs >= 1.0 {
+        header_spans.push(Span::styled(
+            format!(" ({secs:.1}s)"),
+            Style::default().fg(t.fade(t.faint, alpha * 0.8)),
+        ));
     }
-    if rows.len() > shown {
-        out.insert(
-            1,
-            Line::from(Span::styled(
-                format!("{}… {} earlier lines", " ".repeat(BODY_INDENT), rows.len() - shown),
-                Style::default().fg(t.fade(t.faint, alpha * 0.6)),
-            )),
-        );
+    if !app.status.thinking.is_off() && w > 36 {
+        header_spans.push(Span::styled(
+            format!(" · {}", app.status.thinking.as_str()),
+            Style::default().fg(t.fade(t.faint, alpha * 0.7)),
+        ));
+    }
+    out.push(Line::from(header_spans));
+
+    let indent = BODY_INDENT;
+    let text_w = w.saturating_sub(indent).max(8);
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            out.push(Line::default());
+            continue;
+        }
+        for row in wrap(trimmed, text_w) {
+            out.push(Line::from(vec![
+                Span::raw(" ".repeat(indent)),
+                Span::styled(
+                    row,
+                    Style::default()
+                        .fg(t.fade(ink, alpha * 0.85))
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+        }
     }
     out
 }
@@ -325,8 +352,7 @@ fn user_lines(text: &str, t: &Theme, w: usize, alpha: f32) -> Vec<Line<'static>>
             head.clone()
         } else {
             vec![
-                Span::styled(" ".to_string(), Style::default().bg(fill)),
-                Span::raw(" ".repeat(USER_INDENT - 1)),
+                Span::styled(" ".repeat(USER_INDENT), Style::default().bg(fill)),
             ]
         };
         // Pad the row so the tint reaches the edge it started at.
@@ -346,38 +372,23 @@ fn user_lines(text: &str, t: &Theme, w: usize, alpha: f32) -> Vec<Line<'static>>
 fn assistant_lines(
     text: &str,
     streaming: bool,
-    finished: u64,
+    _finished: u64,
     app: &App,
     w: usize,
     alpha: f32,
 ) -> Vec<Line<'static>> {
     let t = &app.theme;
-    let body_w = w.saturating_sub(BODY_INDENT);
-    let mut md = markdown::render(text, t, body_w);
-    // A streaming message stays readable while it grows in; the rest fades in
-    // normally and sits at full strength once it is done.
+    let mut md = markdown::render(text, t, w);
     let a = if streaming { alpha.max(0.6) } else { alpha };
 
-    let bar = Span::styled(
-        "▌".to_string(),
-        Style::default().fg(t.fade(t.accent2, a)),
-    );
-    for (i, line) in md.iter_mut().enumerate() {
-        let mut spans = Vec::new();
-        if i == 0 {
-            spans.push(bar.clone());
-            spans.push(Span::raw(" ".to_string()));
-        } else {
-            spans.push(Span::raw(" ".repeat(BODY_INDENT)));
-        }
-        spans.extend(line.spans.drain(..));
-        if a < 1.0 {
-            spans = spans
+    if a < 1.0 {
+        for line in md.iter_mut() {
+            let spans = std::mem::take(&mut line.spans);
+            line.spans = spans
                 .into_iter()
                 .map(|s| Span::styled(s.content, fade_style(s.style, t, a)))
                 .collect();
         }
-        *line = Line::from(spans);
     }
 
     if streaming {
@@ -391,31 +402,6 @@ fn assistant_lines(
         match md.last_mut() {
             Some(last) => last.spans.push(caret),
             None => md.push(Line::from(caret)),
-        }
-    } else if finished > 0 {
-        // The caret's place is taken by a dot that cools off, and a rule
-        // sweeps out under the message to say it landed.
-        let settle = Tween::delayed(140, 520, anim::Ease::OutQuint);
-        let sweep = Tween::new(560, anim::Ease::OutQuint);
-        if !settle.done(app.now, finished) {
-            let c = theme::lerp(t.accent2, t.dim, settle.t(app.now, finished));
-            let dot = Span::styled("·".to_string(), Style::default().fg(t.c(c)));
-            match md.last_mut() {
-                Some(last) => last.spans.push(dot),
-                None => md.push(Line::from(dot)),
-            }
-        } else if !sweep.done(app.now, finished) {
-            let t_sweep = sweep.t(app.now, finished);
-            let cols = (body_w as f32 * t_sweep).round() as usize;
-            let alpha_out = 1.0 - ((t_sweep - 0.6) / 0.4).clamp(0.0, 1.0);
-            let spans: Vec<Span> = (0..cols)
-                .map(|i| {
-                    let f = i as f32 / cols.max(1) as f32;
-                    let c = theme::grad(t.accent2, t.accent, f);
-                    Span::styled("─".to_string(), Style::default().fg(t.fade(c, alpha_out)))
-                })
-                .collect();
-            md.push(Line::from(spans));
         }
     }
     md
@@ -458,55 +444,33 @@ fn apply_comet(line: &mut Line<'static>, tail: usize, hot: theme::Rgb, gain: f32
 
 fn thinking_lines(app: &App, born: u64, w: usize, alpha: f32) -> Vec<Line<'static>> {
     let t = &app.theme;
-    let label = "Thinking";
-    let cols = label.chars().count();
-    let phase = anim::saw(app.now, 1600);
     let ink = theme::thinking_color(app.status.thinking);
-    let colors = anim::shimmer_colors(ink, t.accent, cols, phase, 2.2);
+    let secs = (app.now.saturating_sub(born)) as f32 / 1000.0;
     let mut spans = vec![
-        Span::raw("  ".to_string()),
         Span::styled(
             format!("{} ", anim::spinner(app.now)),
             Style::default().fg(t.fade(t.amber, alpha)),
         ),
+        Span::styled(
+            "Thinking...".to_string(),
+            Style::default()
+                .fg(t.fade(ink, alpha * 0.9))
+                .add_modifier(Modifier::ITALIC),
+        ),
     ];
-    for (ch, color) in label.chars().zip(colors) {
+    if secs >= 1.0 {
         spans.push(Span::styled(
-            ch.to_string(),
-            Style::default().fg(t.fade(color, alpha)),
+            format!(" ({secs:.1}s)"),
+            Style::default().fg(t.fade(t.faint, alpha * 0.8)),
         ));
     }
-    let secs = (app.now.saturating_sub(born)) as f32 / 1000.0;
-    if secs > 2.0 && w > 30 {
+    if !app.status.thinking.is_off() && w > 36 {
         spans.push(Span::styled(
-            format!("  {secs:.0}s"),
-            Style::default().fg(t.fade(t.faint, alpha)),
+            format!(" · {}", app.status.thinking.as_str()),
+            Style::default().fg(t.fade(ink, alpha * 0.7)),
         ));
     }
-    let mut out = vec![Line::from(spans)];
-
-    // Two skeleton rows, shimmering, so the wait has something alive in it.
-    let skel_phase = anim::saw(app.now, 1900);
-    for (row, len_frac) in [(0usize, 1.0f32), (1usize, 0.62f32)] {
-        let cols = ((w.saturating_sub(CARD_INDENT)) as f32 * len_frac).round() as usize;
-        let cols = cols.min(38);
-        let colors = anim::skeleton_colors(
-            cols,
-            (skel_phase + row as f32 * 0.12).fract(),
-            4.0,
-            t.faint,
-            ink,
-        );
-        let mut s = vec![Span::raw(" ".repeat(BODY_INDENT))];
-        for color in colors {
-            s.push(Span::styled(
-                "▁".to_string(),
-                Style::default().fg(t.fade(color, alpha * 0.5)),
-            ));
-        }
-        out.push(Line::from(s));
-    }
-    out
+    vec![Line::from(spans)]
 }
 
 /// What a running tool is doing, in the present tense (opencode's idea).
@@ -981,11 +945,11 @@ mod tests {
     }
 
     #[test]
-    fn thinking_draws_skeleton() {
+    fn thinking_draws_indicator() {
         let app = app_with(vec![Item::Thinking { born: 4_000 }]);
         let out = render(&app, 44, 8);
         assert!(out.contains("Thinking"), "{out}");
-        assert!(out.contains("▁"), "skeleton rows should be drawn");
+        assert!(!out.contains("▁"), "clean single-line indicator without skeleton clutter");
     }
 
     #[test]
@@ -1062,5 +1026,54 @@ mod tests {
         assert!(out.contains("alpha"));
         assert!(out.contains("beta"));
         assert!(out.contains("▾"));
+    }
+
+    #[test]
+    fn visual_layout_inspection() {
+        let app = app_with(vec![
+            Item::User { text: "how do I list files?".into(), born: 0 },
+            Item::Reasoning {
+                text: "The user is asking how to list files in Linux or Android. I should suggest ls or find.".into(),
+                born: 1_000,
+                finished: 3_200,
+            },
+            Item::Tool {
+                name: "shell".into(),
+                args: r#"{"command":"ls -la"}"#.into(),
+                state: ToolState::Done {
+                    ok: true,
+                    ms: 18,
+                    output: "total 4\n-rw-r--r-- 1 user 100 file.txt".into(),
+                    at: 3_500,
+                },
+                born: 3_200,
+                expanded: false,
+                expand_at: 0,
+            },
+            Item::Assistant {
+                text: "# File Listing\n\nYou can use `ls` to list directory contents:\n\n```bash\nls -la\n```\n\nKey flags:\n- `-l`: long listing format\n- `-a`: include hidden files".into(),
+                born: 3_500,
+                streaming: false,
+                finished: 4_500,
+            },
+        ]);
+        let out = render(&app, 44, 24);
+        let out_narrow = render(&app, 36, 24);
+        let mut app_open = app;
+        app_open.thinking_open = true;
+        let out_open = render(&app_open, 44, 24);
+        println!("=== VISUAL RENDER (44 cols) ===\n{out}\n===============================");
+        println!("=== VISUAL RENDER (36 cols) ===\n{out_narrow}\n===============================");
+        println!("=== VISUAL RENDER (OPEN THINKING) ===\n{out_open}\n===============================");
+        assert!(out.contains("how do I list files?"));
+        assert!(out.contains("Thought for 2s"));
+        assert!(!out.contains("│ Thought"), "no vertical pipe on collapsed thought");
+        assert!(out.contains("File Listing"));
+        assert!(out.contains("```bash"));
+        assert!(out.contains("Key flags:"));
+        assert!(out.contains("• -l:"));
+        assert!(out_narrow.contains("Thought for 2s"));
+        assert!(out_open.contains("▾ Thought for 2s"));
+        assert!(out_open.contains("The user is asking how to list files"));
     }
 }

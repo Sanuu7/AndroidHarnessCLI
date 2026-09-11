@@ -174,6 +174,7 @@ pub fn top_mask(row: usize, rows: usize, strength: f32) -> f32 {
 
 /// A skeleton placeholder row: faint cells with a bright band travelling
 /// through them, so the wait before the first token has something alive in it.
+#[allow(dead_code)]
 pub fn skeleton_colors(cols: usize, phase: f32, width: f32, base: Rgb, hot: Rgb) -> Vec<Rgb> {
     let center = phase * cols as f32;
     (0..cols)
@@ -186,6 +187,7 @@ pub fn skeleton_colors(cols: usize, phase: f32, width: f32, base: Rgb, hot: Rgb)
 
 /// A text color where a bright band travels across `cols` characters.
 /// `phase` is 0..1 across the whole span; cells near it get brighter.
+#[allow(dead_code)]
 pub fn shimmer_colors(
     base: Rgb,
     hot: Rgb,

@@ -91,29 +91,16 @@ fn flush_para(out: &mut Vec<Line<'static>>, para: &mut Vec<String>, theme: &Them
 }
 
 fn push_header(rest: &str, level: usize, theme: &Theme, width: usize) -> Vec<Line<'static>> {
-    // Headings are warm, the way both pi and opencode colour them, so a long
-    // answer has structure you can see while scrolling.
     let fg = match level {
         1 => theme.md_heading,
-        2 => theme::lerp(theme.md_heading, theme.accent, 0.4),
+        2 => theme::lerp(theme.md_heading, theme.accent, 0.35),
         _ => theme.accent,
     };
     let style = Style::default().fg(theme.c(fg)).add_modifier(Modifier::BOLD);
-    let mut spans = Vec::new();
-    if level <= 2 {
-        spans.push(Span::styled("▏ ", Style::default().fg(theme.c(theme.md_heading))));
-    }
-    spans.push(Span::styled(rest.to_string(), style));
-    let mut lines = vec![Line::from(spans)];
-    // Headers wrap without the marker on continuation lines.
-    let rows = wrap(rest, width.saturating_sub(2));
-    if rows.len() > 1 {
-        lines = rows
-            .into_iter()
-            .map(|r| Line::from(Span::styled(r, style)))
-            .collect();
-    }
-    lines
+    wrap(rest, width)
+        .into_iter()
+        .map(|r| Line::from(Span::styled(r, style)))
+        .collect()
 }
 
 fn push_bullet(rest: &str, depth: usize, theme: &Theme, width: usize) -> Vec<Line<'static>> {
@@ -121,7 +108,7 @@ fn push_bullet(rest: &str, depth: usize, theme: &Theme, width: usize) -> Vec<Lin
     let marker_w = 2;
     let text_w = width.saturating_sub(indent + marker_w).max(4);
     let rows = wrap(rest, text_w);
-    let dot = Style::default().fg(theme.c(theme.accent));
+    let dot = Style::default().fg(theme.c(theme.dim));
     let mut lines = Vec::new();
     for (i, row) in rows.iter().enumerate() {
         let lead = if i == 0 {
@@ -175,21 +162,28 @@ fn push_quote(rest: &str, theme: &Theme, width: usize) -> Vec<Line<'static>> {
 }
 
 fn push_code(out: &mut Vec<Line<'static>>, lang: &str, buf: &[String], theme: &Theme, width: usize) {
-    let bg = Style::default().bg(theme.c(theme.code_bg));
+    let border_style = Style::default().fg(theme.c(theme.faint));
+    let lang_style = Style::default()
+        .fg(theme.c(theme.accent))
+        .add_modifier(Modifier::BOLD);
+
+    let mut fence_spans = vec![Span::styled("```".to_string(), border_style)];
     if !lang.is_empty() {
-        out.push(Line::from(Span::styled(
-            format!(" {} ", truncate(lang, width.saturating_sub(2))),
-            bg.fg(theme.c(theme.accent2)).add_modifier(Modifier::BOLD),
-        )));
+        fence_spans.push(Span::styled(lang.to_string(), lang_style));
     }
+    out.push(Line::from(fence_spans));
+
+    let bg = Style::default().bg(theme.c(theme.code_bg));
     let diff = lang.eq_ignore_ascii_case("diff") || lang.eq_ignore_ascii_case("patch");
+    let content_w = width.saturating_sub(2).max(4);
     for line in buf {
-        let text = pad_right(&truncate(line, width), width);
+        let text = pad_right(&truncate(line, content_w), content_w);
         out.push(Line::from(Span::styled(
-            text,
+            format!("  {text}"),
             bg.fg(theme.c(code_color(line, diff, theme))),
         )));
     }
+    out.push(Line::from(Span::styled("```".to_string(), border_style)));
 }
 
 /// A diff should read at a glance: additions green, removals red, hunk
